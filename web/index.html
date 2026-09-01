@@ -10,7 +10,7 @@
   </head>
   <body>
     <main class="container">
-      <h1>ZPWU-CODE 控制台（简易框架）</h1>
+      <h1>ZPWU-CODE 手机端云智能体（MVP）</h1>
 
       <section class="card">
         <h2>连接状态</h2>
@@ -19,18 +19,53 @@
       </section>
 
       <section class="card">
-        <h2>对话</h2>
-        <label>Agent 名称 <input id="agent" value="default" /></label>
-        <label>API Key（仅当前页面内存暂存） <input id="apiKey" type="password" placeholder="sk-..." /></label>
-        <label>消息 <textarea id="message" rows="4" placeholder="输入你的问题"></textarea></label>
-        <button id="sendChat">发送</button>
+        <h2>自定义 API 提供商</h2>
+        <label>Provider ID（可选，留空自动生成）<input id="providerId" placeholder="provider-openai" /></label>
+        <label>名称<input id="providerName" placeholder="OpenAI / Gemini / 自建网关" /></label>
+        <label>Base URL<input id="providerBaseUrl" placeholder="https://api.openai.com" /></label>
+        <label>Model<input id="providerModel" placeholder="gpt-4.1-mini" /></label>
+        <label>API Key（仅提交到后端，不会回显）<input id="providerApiKey" type="password" placeholder="sk-..." /></label>
+        <label>自定义 Headers（JSON，可选）<textarea id="providerHeaders" rows="3" placeholder='{"X-Custom":"value"}'></textarea></label>
+        <label class="inline"><input id="providerActive" type="checkbox" checked /> 保存后设为当前激活</label>
+        <div class="row">
+          <button id="saveProvider">保存提供商</button>
+          <button id="refreshProviders" class="secondary">刷新列表</button>
+        </div>
+        <label>切换激活 Provider
+          <select id="activeProviderSelect"></select>
+        </label>
+        <button id="setActiveProvider" class="secondary">设为激活</button>
+        <pre id="providerResult"></pre>
+      </section>
+
+      <section class="card">
+        <h2>手机端对话编程</h2>
+        <label>Agent 名称 <input id="agent" value="mobile-dev" /></label>
+        <label>指定 Provider ID（可选，留空使用激活 Provider）<input id="chatProviderId" placeholder="provider-openai" /></label>
+        <label>消息 <textarea id="message" rows="5" placeholder="例如：帮我生成一个 Go HTTP handler"></textarea></label>
+        <button id="sendChat">提交任务</button>
         <pre id="chatResult"></pre>
       </section>
 
       <section class="card">
-        <h2>Git 同步</h2>
-        <button id="syncGit">触发同步</button>
+        <h2>GitHub 仓库存储同步</h2>
+        <label>Owner<input id="repoOwner" placeholder="wszpwu1" /></label>
+        <label>Repo<input id="repoName" placeholder="ZPWU-CODE" /></label>
+        <label>Branch<input id="repoBranch" placeholder="main / feature/mobile-agent" /></label>
+        <label>文件路径<input id="syncFilePath" placeholder="mobile-agent/output.txt" /></label>
+        <label>文件内容<textarea id="syncContent" rows="4" placeholder="要写入 GitHub 的内容"></textarea></label>
+        <label>提交信息<input id="syncCommitMessage" placeholder="feat: add mobile agent output" /></label>
+        <label>GitHub Token（仅当前页面内存）<input id="githubToken" type="password" placeholder="ghp_..." /></label>
+        <button id="syncGit">提交到 GitHub</button>
         <pre id="syncResult"></pre>
+      </section>
+
+      <section class="card">
+        <h2>任务状态</h2>
+        <div class="row">
+          <button id="refreshTasks" class="secondary">刷新任务列表</button>
+        </div>
+        <pre id="taskResult"></pre>
       </section>
     </main>
 
