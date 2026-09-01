@@ -3,24 +3,18 @@ package config
 import "os"
 
 type Config struct {
-	Addr              string
-	RepoOwner         string
-	RepoName          string
-	RepoBranch        string
-	ProviderStorePath string
-	EncryptionKey     string
-	AccessToken       string
+	Addr           string
+	AccessToken    string // server-level guard token (optional, for self-hosted protection)
+	GitHubClientID string
+	GitHubSecret   string
 }
 
 func Load() Config {
 	return Config{
-		Addr:              getEnv("APP_ADDR", ":8080"),
-		RepoOwner:         getEnv("GITHUB_REPO_OWNER", "wszpwu1"),
-		RepoName:          getEnv("GITHUB_REPO_NAME", "ZPWU-CODE"),
-		RepoBranch:        getEnv("GITHUB_REPO_BRANCH", "main"),
-		ProviderStorePath: getEnv("PROVIDER_STORE_PATH", "data/providers.json"),
-		EncryptionKey:     getEnv("APP_ENCRYPTION_KEY", ""),
-		AccessToken:       getEnv("APP_ACCESS_TOKEN", ""),
+		Addr:           getEnv("APP_ADDR", ":8080"),
+		AccessToken:    getEnv("APP_ACCESS_TOKEN", ""),
+		GitHubClientID: getEnv("GITHUB_CLIENT_ID", ""),
+		GitHubSecret:   getEnv("GITHUB_CLIENT_SECRET", ""),
 	}
 }
 

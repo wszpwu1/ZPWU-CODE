@@ -2,73 +2,315 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0f172a" />
-    <title>ZPWU-CODE 控制台</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#080c14" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>ZPWU Agent</title>
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="container">
-      <h1>ZPWU-CODE 手机端云智能体（MVP）</h1>
 
-      <section class="card">
-        <h2>连接状态</h2>
-        <label>应用访问令牌（X-App-Token）<input id="appToken" type="password" placeholder="APP_ACCESS_TOKEN" /></label>
-        <p id="health">未检测</p>
-        <button id="checkHealth">检查健康状态</button>
-      </section>
+    <!-- ── 登录页 ─────────────────────────────────────── -->
+    <div id="loginPage" class="login-page" hidden>
+      <!-- 背景装饰 -->
+      <div class="login-bg">
+        <div class="bg-orb orb1"></div>
+        <div class="bg-orb orb2"></div>
+        <div class="bg-orb orb3"></div>
+      </div>
 
-      <section class="card">
-        <h2>自定义 API 提供商</h2>
-        <label>Provider ID（可选，留空自动生成）<input id="providerId" placeholder="provider-openai" /></label>
-        <label>名称<input id="providerName" placeholder="OpenAI / Gemini / 自建网关" /></label>
-        <label>Base URL<input id="providerBaseUrl" placeholder="https://api.openai.com" /></label>
-        <label>Model<input id="providerModel" placeholder="gpt-4.1-mini" /></label>
-        <label>API Key（仅提交到后端，不会回显）<input id="providerApiKey" type="password" placeholder="sk-..." /></label>
-        <label>自定义 Headers（JSON，可选）<textarea id="providerHeaders" rows="3" placeholder='{"X-Custom":"value"}'></textarea></label>
-        <label class="inline"><input id="providerActive" type="checkbox" checked /> 保存后设为当前激活</label>
-        <div class="row">
-          <button id="saveProvider">保存提供商</button>
-          <button id="refreshProviders" class="secondary">刷新列表</button>
+      <div class="login-card glass">
+        <div class="login-logo-wrap">
+          <div class="login-logo-ring">
+            <span class="login-logo" aria-hidden="true">⚡</span>
+          </div>
         </div>
-        <label>切换激活 Provider
-          <select id="activeProviderSelect"></select>
-        </label>
-        <button id="setActiveProvider" class="secondary">设为激活</button>
-        <pre id="providerResult"></pre>
-      </section>
+        <h1 class="login-title">ZPWU Agent</h1>
+        <p class="login-subtitle">Cloud AI · GitHub Native · Zero Storage</p>
+        <p class="login-desc">以 GitHub 为唯一存储，AI 直接读写你的仓库，服务器不留痕迹。</p>
 
-      <section class="card">
-        <h2>手机端对话编程</h2>
-        <label>Agent 名称 <input id="agent" value="mobile-dev" /></label>
-        <label>指定 Provider ID（可选，留空使用激活 Provider）<input id="chatProviderId" placeholder="provider-openai" /></label>
-        <label>消息 <textarea id="message" rows="5" placeholder="例如：帮我生成一个 Go HTTP handler"></textarea></label>
-        <button id="sendChat">提交任务</button>
-        <pre id="chatResult"></pre>
-      </section>
+        <a id="githubOAuthBtn" href="/api/auth/github" class="btn-github">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2z"/>
+          </svg>
+          <span>使用 GitHub 登录</span>
+        </a>
 
-      <section class="card">
-        <h2>GitHub 仓库存储同步</h2>
-        <label>Owner<input id="repoOwner" placeholder="wszpwu1" /></label>
-        <label>Repo<input id="repoName" placeholder="ZPWU-CODE" /></label>
-        <label>Branch<input id="repoBranch" placeholder="main / feature/mobile-agent" /></label>
-        <label>文件路径<input id="syncFilePath" placeholder="mobile-agent/output.txt" /></label>
-        <label>文件内容<textarea id="syncContent" rows="4" placeholder="要写入 GitHub 的内容"></textarea></label>
-        <label>提交信息<input id="syncCommitMessage" placeholder="feat: add mobile agent output" /></label>
-        <label>GitHub Token（仅当前页面内存）<input id="githubToken" type="password" placeholder="ghp_..." /></label>
-        <button id="syncGit">提交到 GitHub</button>
-        <pre id="syncResult"></pre>
-      </section>
-
-      <section class="card">
-        <h2>任务状态</h2>
-        <div class="row">
-          <button id="refreshTasks" class="secondary">刷新任务列表</button>
+        <div class="login-features">
+          <div class="login-feature"><span class="feat-icon">🔒</span> API Key 仅存浏览器</div>
+          <div class="login-feature"><span class="feat-icon">🤖</span> AI 自动操作仓库</div>
+          <div class="login-feature"><span class="feat-icon">⚡</span> OpenAI &amp; Claude</div>
         </div>
-        <pre id="taskResult"></pre>
-      </section>
-    </main>
+
+        <div id="loginStatus" class="login-status" role="status" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <!-- ── 主应用 ──────────────────────────────────────── -->
+    <div id="app" hidden>
+
+      <!-- 顶部 Header -->
+      <header class="app-header glass-header">
+        <div class="header-brand">
+          <span class="header-logo" aria-hidden="true">⚡</span>
+          <span class="header-title">ZPWU</span>
+          <span class="header-badge">Agent</span>
+        </div>
+        <div class="header-actions">
+          <div id="headerUserInfo" class="header-user" role="status" aria-live="polite">
+            <img id="headerAvatar" src="" alt="" class="header-avatar" hidden />
+            <span id="headerLogin" class="header-login"></span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Tab 导航 -->
+      <nav class="tab-bar" role="tablist" aria-label="主导航">
+        <button class="tab-btn active" data-tab="chat" role="tab" aria-selected="true">
+          <span class="tab-icon" aria-hidden="true">💬</span>
+          <span class="tab-label">对话</span>
+        </button>
+        <button class="tab-btn" data-tab="files" role="tab" aria-selected="false">
+          <span class="tab-icon" aria-hidden="true">📁</span>
+          <span class="tab-label">文件</span>
+        </button>
+        <button class="tab-btn" data-tab="providers" role="tab" aria-selected="false">
+          <span class="tab-icon" aria-hidden="true">🔑</span>
+          <span class="tab-label">API</span>
+        </button>
+        <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false">
+          <span class="tab-icon" aria-hidden="true">⚙️</span>
+          <span class="tab-label">设置</span>
+        </button>
+      </nav>
+
+      <main class="tab-content">
+
+        <!-- ── 对话 ──────────────────────────────────────── -->
+        <section id="tab-chat" class="tab-panel active" role="tabpanel">
+          <div class="chat-layout">
+
+            <!-- 顶部状态条 -->
+            <div class="chat-status-bar">
+              <div id="chatProviderBar" class="status-chip status-chip-blue" role="status" aria-live="polite">
+                <span class="chip-dot"></span>
+                <span id="chatProviderName" class="chip-text">未选择 API</span>
+                <button class="chip-btn" data-tab-goto="providers" aria-label="配置 API">+</button>
+              </div>
+              <div id="chatRepoBar" class="status-chip status-chip-green" role="status" aria-live="polite">
+                <span class="chip-dot"></span>
+                <span id="chatRepoName" class="chip-text">未选择仓库</span>
+                <button class="chip-btn" data-tab-goto="files" aria-label="选择仓库">+</button>
+              </div>
+            </div>
+
+            <!-- 文件上下文条 -->
+            <div class="context-strip" id="contextBar" hidden>
+              <span class="context-icon">📎</span>
+              <span id="contextFileName" class="context-name"></span>
+              <button id="clearContext" class="context-close" aria-label="清除上下文">✕</button>
+            </div>
+
+            <!-- 消息区 -->
+            <div id="chatMessages" class="chat-messages" role="log" aria-live="polite" aria-label="对话记录"></div>
+
+            <!-- 输入区 -->
+            <div class="chat-input-wrap glass-input">
+              <input id="chatSystem" class="system-input"
+                     placeholder="System prompt（可选）"
+                     aria-label="系统提示词" />
+              <div class="agent-toggle-row">
+                <label class="toggle-label">
+                  <span class="toggle-wrap">
+                    <input id="agentMode" type="checkbox" class="toggle-input" />
+                    <span class="toggle-track"></span>
+                    <span class="toggle-thumb"></span>
+                  </span>
+                  <span class="toggle-text">🤖 Agent 模式 — AI 自动读写 GitHub 文件</span>
+                </label>
+              </div>
+              <div class="chat-input-row">
+                <textarea id="chatMessage" rows="3"
+                          placeholder="输入消息… Ctrl+Enter 发送"
+                          aria-label="输入消息"></textarea>
+                <button id="sendChat" class="send-btn" aria-label="发送">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                  </svg>
+                </button>
+              </div>
+              <div id="agentRepoHint" class="agent-hint" hidden>
+                ⚠ Agent 模式需要先在「文件」面板选择仓库
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- ── 文件 ──────────────────────────────────────── -->
+        <section id="tab-files" class="tab-panel" role="tabpanel" hidden>
+          <div class="file-layout">
+
+            <!-- 仓库选择栏 -->
+            <div class="repo-bar glass-bar">
+              <select id="repoSelect" class="repo-select" aria-label="选择仓库"></select>
+              <input id="repoBranchInput" class="branch-input" placeholder="main" aria-label="分支" />
+              <button id="loadRepoBtn" class="icon-btn" title="加载" aria-label="加载仓库">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+                  <polyline points="23 4 23 10 17 10"></polyline>
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                </svg>
+              </button>
+            </div>
+
+            <!-- 文件树 -->
+            <div class="file-tree-pane">
+              <div class="pane-header">
+                <span id="fileTreePath" class="pane-path" aria-live="polite">/ 根目录</span>
+                <button id="refreshFiles" class="icon-btn-sm" title="刷新" aria-label="刷新">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+                    <polyline points="23 4 23 10 17 10"></polyline>
+                    <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+                  </svg>
+                </button>
+              </div>
+              <div id="fileTree" class="file-tree" role="tree" aria-label="文件列表">
+                <p class="empty-hint">选择仓库后点击刷新</p>
+              </div>
+            </div>
+
+            <!-- 编辑器 -->
+            <div class="file-editor-pane">
+              <div class="pane-header">
+                <span id="editorFilePath" class="pane-path" aria-live="polite">未打开文件</span>
+                <div class="pane-actions">
+                  <button id="injectContext" class="action-btn" title="注入AI上下文" aria-label="注入上下文" disabled>→AI</button>
+                  <button id="saveFile" class="action-btn action-btn-primary" title="保存到GitHub" aria-label="保存" disabled>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+                      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                      <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                      <polyline points="7 3 7 8 15 8"></polyline>
+                    </svg>
+                    保存
+                  </button>
+                </div>
+              </div>
+              <textarea id="fileEditor" class="code-editor"
+                        placeholder="打开文件后在此编辑…"
+                        aria-label="文件内容编辑器" spellcheck="false"></textarea>
+              <div class="editor-footer">
+                <div class="commit-row">
+                  <label class="commit-label" for="commitMessage">提交信息</label>
+                  <input id="commitMessage" class="commit-input" placeholder="fix: update file" aria-label="提交信息" />
+                </div>
+                <div id="editorStatus" class="editor-status" role="status" aria-live="polite"></div>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- ── API 提供商 ─────────────────────────────────── -->
+        <section id="tab-providers" class="tab-panel" role="tabpanel" hidden>
+          <div class="panel-scroll">
+
+            <div class="section-header">
+              <h2 class="section-title">AI 提供商</h2>
+              <p class="section-desc">配置仅保存在浏览器本地，API Key 不经过服务器持久化。</p>
+            </div>
+
+            <div class="glass-card">
+              <h3 class="card-title">添加 / 编辑</h3>
+              <div class="form-grid">
+                <label class="form-label">
+                  名称
+                  <input id="pvName" class="form-input" placeholder="我的 OpenAI" />
+                </label>
+                <label class="form-label">
+                  类型
+                  <select id="pvKind" class="form-input" aria-label="API 类型">
+                    <option value="openai">OpenAI 兼容（DeepSeek / Qwen / Ollama…）</option>
+                    <option value="claude">Claude（Anthropic 原生）</option>
+                  </select>
+                </label>
+                <label class="form-label form-full">
+                  Base URL
+                  <input id="pvBaseURL" class="form-input" placeholder="https://api.openai.com（Claude 可留空）" />
+                </label>
+                <label class="form-label">
+                  模型
+                  <input id="pvModel" class="form-input" placeholder="gpt-4.1-mini" />
+                </label>
+                <label class="form-label">
+                  API Key
+                  <input id="pvKey" type="password" class="form-input" placeholder="sk-…" autocomplete="off" />
+                </label>
+                <label class="form-label form-full">
+                  自定义 Headers（JSON，可选）
+                  <textarea id="pvHeaders" class="form-input form-textarea" rows="2" placeholder='{"X-Custom":"value"}'></textarea>
+                </label>
+              </div>
+              <div class="form-actions">
+                <button id="pvSave" class="btn-primary">保存提供商</button>
+                <button id="pvClear" class="btn-ghost">清空</button>
+              </div>
+            </div>
+
+            <div class="glass-card" style="margin-top:0">
+              <h3 class="card-title">已保存提供商</h3>
+              <div id="pvList" class="pv-list" role="list" aria-live="polite">
+                <p class="empty-hint">暂无提供商，请先添加。</p>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- ── 设置 ──────────────────────────────────────── -->
+        <section id="tab-settings" class="tab-panel" role="tabpanel" hidden>
+          <div class="panel-scroll">
+
+            <div class="section-header">
+              <h2 class="section-title">设置</h2>
+            </div>
+
+            <div class="glass-card">
+              <h3 class="card-title">GitHub 账号</h3>
+              <div id="userInfo" class="user-profile" role="status">
+                <img id="userAvatar" src="" alt="" class="user-avatar" hidden />
+                <div class="user-meta">
+                  <div id="userName" class="user-name">加载中…</div>
+                  <div id="userLogin" class="user-login"></div>
+                </div>
+              </div>
+              <button id="logoutBtn" class="btn-danger" style="margin-top:16px">退出登录</button>
+            </div>
+
+            <div class="glass-card">
+              <h3 class="card-title">应用令牌（可选）</h3>
+              <p class="card-desc">若服务器设置了 <code>APP_ACCESS_TOKEN</code>，需填写。</p>
+              <label class="form-label">
+                X-App-Token
+                <input id="appToken" type="password" class="form-input" placeholder="留空则不需要" autocomplete="off" />
+              </label>
+              <button id="saveAppToken" class="btn-secondary" style="margin-top:10px">保存令牌</button>
+            </div>
+
+            <div class="glass-card">
+              <h3 class="card-title">连接状态</h3>
+              <div id="healthStatus" class="health-status" role="status" aria-live="polite">点击检查</div>
+              <button id="checkHealth" class="btn-secondary" style="margin-top:10px">检查服务器</button>
+            </div>
+
+          </div>
+        </section>
+
+      </main>
+    </div>
 
     <script src="/app.js"></script>
   </body>

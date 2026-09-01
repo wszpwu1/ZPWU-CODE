@@ -3,10 +3,6 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -16,7 +12,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -24,78 +19,69 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/wszpwu1/ZPWU-CODE/internal/agent"
 	"github.com/wszpwu1/ZPWU-CODE/internal/config"
 )
 
-type chatRequest struct {
-	Message    string `json:"message"`
-	Agent      string `json:"agent"`
-	ProviderID string `json:"provider_id"`
-}
+// ─── Request / Response types ───────────────────────────────────────────────
 
 type jsonResponse map[string]any
 
-type providerUpsertRequest struct {
-	ID      string            `json:"id"`
+// chatRequest — provider info travels with every request; server stores nothing.
+type chatRequest struct {
+	Message    string            `json:"message"`
+	System     string            `json:"system"`
+	Context    string            `json:"context"` // file content injected before user message
+	Agent      string            `json:"agent"`
+	ProviderID string            `json:"provider_id"` // informational only
+	Provider   providerInlineReq `json:"provider"`    // full provider inline
+}
+
+// providerInlineReq is sent by the browser on every AI call; never persisted.
+type providerInlineReq struct {
 	Name    string            `json:"name"`
 	BaseURL string            `json:"base_url"`
 	Model   string            `json:"model"`
 	APIKey  string            `json:"api_key"`
+	Kind    string            `json:"kind"` // "openai" | "claude"
 	Headers map[string]string `json:"headers"`
-	Active  bool              `json:"active"`
 }
 
-type setActiveProviderRequest struct {
-	ID string `json:"id"`
+type gitSyncRequest struct {
+	Owner         string `json:"owner"`
+	Repo          string `json:"repo"`
+	Branch        string `json:"branch"`
+	FilePath      string `json:"file_path"`
+	Content       string `json:"content"`
+	CommitMessage string `json:"commit_message"`
 }
 
-type providerPublic struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	BaseURL    string            `json:"base_url"`
-	Model      string            `json:"model"`
-	Headers    map[string]string `json:"headers"`
-	MaskedKey  string            `json:"masked_key"`
-	Active     bool              `json:"active"`
-	CreatedAt  string            `json:"created_at"`
-	UpdatedAt  string            `json:"updated_at"`
-	LastUsedAt string            `json:"last_used_at,omitempty"`
+type gitCommitResult struct {
+	CommitSHA string `json:"commit_sha"`
+	HTMLURL   string `json:"html_url"`
+	FilePath  string `json:"file_path"`
+	Branch    string `json:"branch"`
 }
 
-type providerRecord struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	BaseURL         string            `json:"base_url"`
-	Model           string            `json:"model"`
-	Headers         map[string]string `json:"headers"`
-	EncryptedAPIKey string            `json:"encrypted_api_key"`
-	MaskedKey       string            `json:"masked_key"`
-	CreatedAt       string            `json:"created_at"`
-	UpdatedAt       string            `json:"updated_at"`
-	LastUsedAt      string            `json:"last_used_at,omitempty"`
+type gitDirEntry struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Type    string `json:"type"` // "file" | "dir"
+	SHA     string `json:"sha"`
+	Size    int    `json:"size,omitempty"`
+	HTMLURL string `json:"html_url"`
 }
 
-type providerStorageFile struct {
-	ActiveID  string           `json:"active_id"`
-	Providers []providerRecord `json:"providers"`
+type gitFileReadResult struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Content string `json:"content"`
+	SHA     string `json:"sha"`
+	Size    int    `json:"size"`
+	HTMLURL string `json:"html_url"`
 }
 
-type providerForUse struct {
-	ID      string
-	Name    string
-	BaseURL string
-	Model   string
-	APIKey  string
-	Headers map[string]string
-}
-
-type providerStore struct {
-	mu       sync.RWMutex
-	path     string
-	key      []byte
-	activeID string
-	items    map[string]providerRecord
-}
+// ─── Task store (in-memory only) ────────────────────────────────────────────
 
 type taskStatus string
 
@@ -129,286 +115,148 @@ type taskStore struct {
 	seq   atomic.Uint64
 }
 
-type gitSyncRequest struct {
-	Owner         string `json:"owner"`
-	Repo          string `json:"repo"`
-	Branch        string `json:"branch"`
-	FilePath      string `json:"file_path"`
-	Content       string `json:"content"`
-	CommitMessage string `json:"commit_message"`
+func newTaskStore() *taskStore {
+	return &taskStore{items: make(map[string]*taskRecord)}
 }
 
-type gitCommitResult struct {
-	CommitSHA string `json:"commit_sha"`
-	HTMLURL   string `json:"html_url"`
-	FilePath  string `json:"file_path"`
-	Branch    string `json:"branch"`
-}
-
-type commandValidationRequest struct {
-	Commands []string `json:"commands"`
-	Paths    []string `json:"paths"`
-}
-
-type commandValidationResult struct {
-	Allowed    bool     `json:"allowed"`
-	Violations []string `json:"violations"`
-	Warnings   []string `json:"warnings"`
-}
-
-func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
-	providers, err := newProviderStore(cfg.ProviderStorePath, cfg.EncryptionKey)
-	if err != nil {
-		log.Printf("provider store init error: %v", err)
+func (s *taskStore) create(taskType string, input any) *taskRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	id := fmt.Sprintf("task-%d-%d", time.Now().UTC().UnixMilli(), s.seq.Add(1))
+	task := &taskRecord{ID: id, Type: taskType, Status: taskQueued, CreatedAt: now, UpdatedAt: now, Input: input}
+	s.items[id] = task
+	s.order = append([]string{id}, s.order...)
+	const maxTasks = 100
+	if len(s.order) > maxTasks {
+		kept := make([]string, 0, len(s.order))
+		for _, tid := range s.order {
+			if len(kept) < maxTasks {
+				kept = append(kept, tid)
+				continue
+			}
+			if t, ok := s.items[tid]; ok && (t.Status == taskCompleted || t.Status == taskFailed) {
+				delete(s.items, tid)
+			} else {
+				kept = append(kept, tid)
+			}
+		}
+		s.order = kept
 	}
-	tasks := newTaskStore()
-	gateway := &llmGateway{
-		client: &http.Client{Timeout: 45 * time.Second},
-	}
-
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-			return
-		}
-		providerConfigured := false
-		if providers != nil {
-			providerConfigured = providers.hasAny()
-		}
-		writeJSON(w, http.StatusOK, jsonResponse{
-			"status": "ok",
-			"time":   time.Now().UTC().Format(time.RFC3339),
-			"checks": jsonResponse{
-				"provider_configured": providerConfigured,
-				"github_repo":         cfg.RepoOwner + "/" + cfg.RepoName + "@" + cfg.RepoBranch,
-				"sandbox_mode":        "policy-validation-only",
-			},
-		})
-	})
-
-	mux.HandleFunc("/api/providers", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeRequest(w, r, cfg.AccessToken) {
-			return
-		}
-		if providers == nil {
-			writeError(w, http.StatusServiceUnavailable, "provider_store_unavailable", "provider store is unavailable")
-			return
-		}
-		switch r.Method {
-		case http.MethodGet:
-			writeJSON(w, http.StatusOK, jsonResponse{
-				"providers": providers.listPublic(),
-				"active_id": providers.activeProviderID(),
-			})
-		case http.MethodPost:
-			var req providerUpsertRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
-				return
-			}
-			pub, err := providers.upsert(req)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, "invalid_provider_config", err.Error())
-				return
-			}
-			writeJSON(w, http.StatusOK, jsonResponse{
-				"provider": pub,
-			})
-		default:
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-		}
-	})
-
-	mux.HandleFunc("/api/providers/active", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeRequest(w, r, cfg.AccessToken) {
-			return
-		}
-		if providers == nil {
-			writeError(w, http.StatusServiceUnavailable, "provider_store_unavailable", "provider store is unavailable")
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-			return
-		}
-		var req setActiveProviderRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
-			return
-		}
-		if err := providers.setActive(req.ID); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_provider_id", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, jsonResponse{
-			"active_id": req.ID,
-		})
-	})
-
-	mux.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeRequest(w, r, cfg.AccessToken) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-			return
-		}
-		writeJSON(w, http.StatusOK, jsonResponse{
-			"tasks": tasks.list(20),
-		})
-	})
-
-	mux.HandleFunc("/api/tasks/", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeRequest(w, r, cfg.AccessToken) {
-			return
-		}
-		if r.Method != http.MethodGet {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-			return
-		}
-		id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
-		if id == "" {
-			writeError(w, http.StatusBadRequest, "invalid_task_id", "task id is required")
-			return
-		}
-		task, ok := tasks.get(id)
-		if !ok {
-			writeError(w, http.StatusNotFound, "task_not_found", "task not found")
-			return
-		}
-		writeJSON(w, http.StatusOK, taskToResponse(task))
-	})
-
-	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeRequest(w, r, cfg.AccessToken) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-			return
-		}
-
-		var req chatRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
-			return
-		}
-		if req.Message == "" {
-			writeError(w, http.StatusBadRequest, "invalid_message", "message is required")
-			return
-		}
-		task := tasks.create("chat", jsonResponse{
-			"agent":       fallback(req.Agent, "default"),
-			"provider_id": req.ProviderID,
-			"message_len": len(req.Message),
-		})
-		writeJSON(w, http.StatusAccepted, jsonResponse{
-			"task_id": task.ID,
-			"status":  task.Status,
-		})
-
-		if providers == nil {
-			tasks.fail(task.ID, "provider_store_unavailable", "provider store is unavailable")
-			return
-		}
-		go func(taskID string, request chatRequest) {
-			tasks.running(taskID)
-			provider, err := providers.resolveProvider(request.ProviderID)
-			if err != nil {
-				tasks.fail(taskID, "provider_not_available", err.Error())
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			reply, usage, err := gateway.chat(ctx, provider, request.Message)
-			if err != nil {
-				tasks.fail(taskID, "upstream_chat_failed", err.Error())
-				return
-			}
-			providers.markUsed(provider.ID)
-			tasks.complete(taskID, jsonResponse{
-				"reply": reply,
-				"meta": jsonResponse{
-					"agent":       fallback(request.Agent, "default"),
-					"provider":    provider.Name,
-					"provider_id": provider.ID,
-					"model":       provider.Model,
-					"usage":       usage,
-				},
-			})
-		}(task.ID, req)
-	})
-
-	mux.HandleFunc("/api/exec/validate", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeRequest(w, r, cfg.AccessToken) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-			return
-		}
-		var req commandValidationRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
-			return
-		}
-		res := validateCommands(req.Commands, req.Paths)
-		writeJSON(w, http.StatusOK, jsonResponse{
-			"result": res,
-		})
-	})
-
-	mux.HandleFunc("/api/git/sync", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeRequest(w, r, cfg.AccessToken) {
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
-			return
-		}
-		token := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
-		if token == "" {
-			writeError(w, http.StatusUnauthorized, "missing_github_token", "github token is required in X-GitHub-Token header")
-			return
-		}
-		var req gitSyncRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
-			return
-		}
-		req.Owner = fallback(req.Owner, cfg.RepoOwner)
-		req.Repo = fallback(req.Repo, cfg.RepoName)
-		req.Branch = fallback(req.Branch, cfg.RepoBranch)
-		if req.FilePath == "" || req.CommitMessage == "" {
-			writeError(w, http.StatusBadRequest, "invalid_sync_request", "file_path and commit_message are required")
-			return
-		}
-
-		task := tasks.create("git_sync", jsonResponse{
-			"repo":   req.Owner + "/" + req.Repo,
-			"branch": req.Branch,
-			"path":   req.FilePath,
-		})
-		writeJSON(w, http.StatusAccepted, jsonResponse{
-			"task_id": task.ID,
-			"status":  task.Status,
-		})
-
-		go func(taskID string, request gitSyncRequest, githubToken string) {
-			tasks.running(taskID)
-			result, code, err := syncToGitHub(context.Background(), githubToken, request)
-			if err != nil {
-				tasks.fail(taskID, code, err.Error())
-				return
-			}
-			tasks.complete(taskID, result)
-		}(task.ID, req, token)
-	})
+	return cloneTask(task)
 }
+
+func (s *taskStore) setStatus(id string, st taskStatus, result any, te *taskError) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.items[id]
+	if !ok {
+		return
+	}
+	task.Status = st
+	task.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	if result != nil {
+		task.Result = result
+	}
+	if te != nil {
+		task.Error = te
+	}
+}
+
+func (s *taskStore) running(id string) { s.setStatus(id, taskRunning, nil, nil) }
+func (s *taskStore) complete(id string, result any) {
+	s.setStatus(id, taskCompleted, result, nil)
+}
+func (s *taskStore) fail(id, code, message string) {
+	s.setStatus(id, taskFailed, nil, &taskError{Code: code, Message: message})
+}
+
+func (s *taskStore) get(id string) (*taskRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.items[id]
+	if !ok {
+		return nil, false
+	}
+	return cloneTask(t), true
+}
+
+func (s *taskStore) list(limit int) []jsonResponse {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 {
+		limit = 20
+	}
+	out := make([]jsonResponse, 0, limit)
+	for _, id := range s.order {
+		if len(out) >= limit {
+			break
+		}
+		if t, ok := s.items[id]; ok {
+			out = append(out, taskToResponse(t))
+		}
+	}
+	return out
+}
+
+func cloneTask(t *taskRecord) *taskRecord {
+	cp := *t
+	if t.Error != nil {
+		e := *t.Error
+		cp.Error = &e
+	}
+	return &cp
+}
+
+func taskToResponse(t *taskRecord) jsonResponse {
+	r := jsonResponse{
+		"id": t.ID, "type": t.Type, "status": t.Status,
+		"created_at": t.CreatedAt, "updated_at": t.UpdatedAt,
+	}
+	if t.Input != nil {
+		r["input"] = t.Input
+	}
+	if t.Result != nil {
+		r["result"] = t.Result
+	}
+	if t.Error != nil {
+		r["error"] = t.Error
+	}
+	return r
+}
+
+// ─── LLM Gateway ────────────────────────────────────────────────────────────
 
 type llmGateway struct {
 	client *http.Client
 }
+
+func newLLMGateway() *llmGateway {
+	return &llmGateway{client: &http.Client{Timeout: 90 * time.Second}}
+}
+
+// chat dispatches to OpenAI-compatible or Claude API depending on provider.Kind.
+func (g *llmGateway) chat(ctx context.Context, req chatRequest) (string, map[string]any, error) {
+	p := req.Provider
+	if strings.TrimSpace(p.APIKey) == "" {
+		return "", nil, errors.New("provider api_key is required")
+	}
+	if strings.TrimSpace(p.BaseURL) == "" && strings.TrimSpace(p.Kind) != "claude" {
+		return "", nil, errors.New("provider base_url is required")
+	}
+
+	userContent := strings.TrimSpace(req.Message)
+	if strings.TrimSpace(req.Context) != "" {
+		userContent = "以下是相关文件内容供参考：\n\n```\n" + strings.TrimSpace(req.Context) + "\n```\n\n" + userContent
+	}
+
+	if strings.ToLower(strings.TrimSpace(p.Kind)) == "claude" {
+		return g.chatClaude(ctx, p, strings.TrimSpace(req.System), userContent)
+	}
+	return g.chatOpenAI(ctx, p, strings.TrimSpace(req.System), userContent)
+}
+
+// ── OpenAI-compatible ────────────────────────────────────────────────────────
 
 type openAIChatResponse struct {
 	Choices []struct {
@@ -419,46 +267,44 @@ type openAIChatResponse struct {
 	Usage map[string]any `json:"usage"`
 }
 
-func (g *llmGateway) chat(ctx context.Context, provider providerForUse, message string) (string, map[string]any, error) {
-	endpoint, err := normalizeChatEndpoint(provider.BaseURL)
+func (g *llmGateway) chatOpenAI(ctx context.Context, p providerInlineReq, system, userContent string) (string, map[string]any, error) {
+	endpoint, err := normalizeChatEndpoint(p.BaseURL)
 	if err != nil {
 		return "", nil, err
 	}
-	payload := jsonResponse{
-		"model": provider.Model,
-		"messages": []jsonResponse{
-			{
-				"role":    "user",
-				"content": message,
-			},
-		},
-		"stream": false,
+	messages := make([]jsonResponse, 0, 3)
+	if system != "" {
+		messages = append(messages, jsonResponse{"role": "system", "content": system})
 	}
+	messages = append(messages, jsonResponse{"role": "user", "content": userContent})
+
+	payload := jsonResponse{"model": p.Model, "messages": messages, "stream": false}
 	bodyBytes, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", nil, fmt.Errorf("build upstream request failed: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	for k, v := range provider.Headers {
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
+	for k, v := range p.Headers {
 		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Content-Type") {
 			continue
 		}
-		req.Header.Set(k, v)
+		httpReq.Header.Set(k, v)
 	}
-	resp, err := g.client.Do(req)
+	resp, err := g.client.Do(httpReq)
 	if err != nil {
 		return "", nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return "", nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, safeSnippet(string(raw)))
 	}
 	var parsed openAIChatResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return "", nil, fmt.Errorf("parse upstream response failed")
+		return "", nil, errors.New("parse upstream response failed")
 	}
 	if len(parsed.Choices) == 0 || strings.TrimSpace(parsed.Choices[0].Message.Content) == "" {
 		return "", nil, errors.New("upstream returned empty reply")
@@ -466,29 +312,85 @@ func (g *llmGateway) chat(ctx context.Context, provider providerForUse, message 
 	return parsed.Choices[0].Message.Content, parsed.Usage, nil
 }
 
-func normalizeChatEndpoint(base string) (string, error) {
-	base = strings.TrimSpace(base)
-	if base == "" {
-		return "", errors.New("base_url is required")
-	}
-	u, err := url.Parse(base)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", errors.New("base_url must be a valid absolute URL")
-	}
-	if strings.HasSuffix(strings.TrimRight(base, "/"), "/v1/chat/completions") {
-		return strings.TrimRight(base, "/"), nil
-	}
-	return strings.TrimRight(base, "/") + "/v1/chat/completions", nil
+// ── Claude (Anthropic Messages API) ─────────────────────────────────────────
+
+type claudeMessagesResponse struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+	Usage map[string]any `json:"usage"`
 }
+
+func (g *llmGateway) chatClaude(ctx context.Context, p providerInlineReq, system, userContent string) (string, map[string]any, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	endpoint := baseURL + "/v1/messages"
+
+	model := p.Model
+	if model == "" {
+		model = "claude-3-5-sonnet-20241022"
+	}
+
+	payload := jsonResponse{
+		"model":      model,
+		"max_tokens": 8192,
+		"messages":   []jsonResponse{{"role": "user", "content": userContent}},
+	}
+	if system != "" {
+		payload["system"] = system
+	}
+	bodyBytes, _ := json.Marshal(payload)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", nil, fmt.Errorf("build claude request failed: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", p.APIKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	for k, v := range p.Headers {
+		lk := strings.ToLower(k)
+		if lk == "x-api-key" || lk == "content-type" || lk == "anthropic-version" {
+			continue
+		}
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := g.client.Do(httpReq)
+	if err != nil {
+		return "", nil, fmt.Errorf("claude request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", nil, fmt.Errorf("claude returned %d: %s", resp.StatusCode, safeSnippet(string(raw)))
+	}
+	var parsed claudeMessagesResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", nil, errors.New("parse claude response failed")
+	}
+	for _, block := range parsed.Content {
+		if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+			return block.Text, parsed.Usage, nil
+		}
+	}
+	return "", nil, errors.New("claude returned empty reply")
+}
+
+// ─── GitHub helpers ──────────────────────────────────────────────────────────
 
 func syncToGitHub(ctx context.Context, token string, req gitSyncRequest) (gitCommitResult, string, error) {
 	safePath, err := sanitizeRepoPath(req.FilePath)
 	if err != nil {
 		return gitCommitResult{}, "invalid_file_path", err
 	}
-
 	client := &http.Client{Timeout: 45 * time.Second}
-	baseURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", req.Owner, req.Repo, escapeGitHubContentPath(safePath))
+	baseURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s",
+		url.PathEscape(req.Owner), url.PathEscape(req.Repo), escapeGitHubContentPath(safePath))
+
 	existingSHA, readCode, readErr := readContentSHA(ctx, client, token, baseURL, req.Branch)
 	if readErr != nil && readCode != "github_content_not_found" {
 		return gitCommitResult{}, readCode, readErr
@@ -519,12 +421,11 @@ func syncToGitHub(ctx context.Context, token string, req gitSyncRequest) (gitCom
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if resp.StatusCode == http.StatusConflict {
-		return gitCommitResult{}, "github_conflict", errors.New("github branch conflict, please refresh branch or choose another branch")
+		return gitCommitResult{}, "github_conflict", errors.New("branch conflict, refresh branch or choose another")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return gitCommitResult{}, "github_write_failed", fmt.Errorf("github returned %d: %s", resp.StatusCode, safeSnippet(string(raw)))
 	}
-
 	var parsed struct {
 		Commit struct {
 			SHA     string `json:"sha"`
@@ -532,12 +433,7 @@ func syncToGitHub(ctx context.Context, token string, req gitSyncRequest) (gitCom
 		} `json:"commit"`
 	}
 	_ = json.Unmarshal(raw, &parsed)
-	return gitCommitResult{
-		CommitSHA: parsed.Commit.SHA,
-		HTMLURL:   parsed.Commit.HTMLURL,
-		FilePath:  safePath,
-		Branch:    req.Branch,
-	}, "", nil
+	return gitCommitResult{CommitSHA: parsed.Commit.SHA, HTMLURL: parsed.Commit.HTMLURL, FilePath: safePath, Branch: req.Branch}, "", nil
 }
 
 func readContentSHA(ctx context.Context, client *http.Client, token, contentURL, branch string) (string, string, error) {
@@ -593,502 +489,549 @@ func escapeGitHubContentPath(path string) string {
 	return strings.Join(parts, "/")
 }
 
-func validateCommands(commands, paths []string) commandValidationResult {
-	allowedPrefixes := []string{
-		"go test", "go run", "go fmt", "git status", "git diff", "git add", "git commit", "npm run", "npm test", "ls", "cat",
-	}
-	forbiddenTokens := []string{"sudo ", "rm -rf /", "mkfs", ":(){:|:&};:", "curl ", "wget ", "chmod 777", "chown "}
-	var violations []string
-	var warnings []string
-
-	for _, cmd := range commands {
-		cmd = strings.TrimSpace(strings.ToLower(cmd))
-		if cmd == "" {
-			continue
-		}
-		matched := false
-		for _, prefix := range allowedPrefixes {
-			if strings.HasPrefix(cmd, strings.ToLower(prefix)) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			violations = append(violations, "command not in allow-list: "+cmd)
-		}
-		for _, token := range forbiddenTokens {
-			if strings.Contains(cmd, token) {
-				violations = append(violations, "dangerous token detected: "+token)
-			}
-		}
-		if strings.Contains(cmd, "| sh") || strings.Contains(cmd, "| bash") {
-			violations = append(violations, "piped shell execution is blocked")
-		}
-	}
-	for _, p := range paths {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if strings.Contains(p, "..") || strings.HasPrefix(p, "/etc") || strings.HasPrefix(p, "/root") || strings.Contains(p, "/.git") {
-			violations = append(violations, "sensitive path blocked: "+p)
-			continue
-		}
-		if strings.HasPrefix(p, "/tmp") {
-			warnings = append(warnings, "temporary path used: "+p)
-		}
-	}
-	return commandValidationResult{
-		Allowed:    len(violations) == 0,
-		Violations: dedup(violations),
-		Warnings:   dedup(warnings),
-	}
+// normalizeChatEndpoint delegates to agent.NormalizeOpenAIEndpoint (#fix9: single implementation).
+func normalizeChatEndpoint(base string) (string, error) {
+	return agent.NormalizeOpenAIEndpoint(base)
 }
 
-func dedup(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(values))
-	out := make([]string, 0, len(values))
-	for _, v := range values {
-		if _, ok := seen[v]; ok {
-			continue
+// ─── Route Registration ──────────────────────────────────────────────────────
+
+func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
+	tasks := newTaskStore()
+	gateway := newLLMGateway()
+	ghClient := &http.Client{Timeout: 30 * time.Second}
+
+	// ── Health ───────────────────────────────────────────────────────────────
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
 		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func newProviderStore(path, encryptionKey string) (*providerStore, error) {
-	if len(strings.TrimSpace(encryptionKey)) < 16 {
-		return nil, errors.New("APP_ENCRYPTION_KEY must be set and at least 16 characters")
-	}
-	sum := sha256.Sum256([]byte(encryptionKey))
-	store := &providerStore{
-		path:  path,
-		key:   sum[:],
-		items: make(map[string]providerRecord),
-	}
-	if err := store.load(); err != nil {
-		return nil, err
-	}
-	return store, nil
-}
-
-func (s *providerStore) load() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, err := os.ReadFile(s.path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	var saved providerStorageFile
-	if err := json.Unmarshal(b, &saved); err != nil {
-		return err
-	}
-	s.activeID = saved.ActiveID
-	for _, item := range saved.Providers {
-		s.items[item.ID] = item
-	}
-	return nil
-}
-
-func (s *providerStore) persist() error {
-	saved := providerStorageFile{
-		ActiveID: s.activeID,
-	}
-	for _, item := range s.items {
-		saved.Providers = append(saved.Providers, item)
-	}
-	sort.Slice(saved.Providers, func(i, j int) bool {
-		return saved.Providers[i].UpdatedAt > saved.Providers[j].UpdatedAt
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"status": "ok",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"checks": jsonResponse{
+				"github_oauth": cfg.GitHubClientID != "",
+				"storage":      "github-only (stateless)",
+			},
+		})
 	})
-	body, err := json.MarshalIndent(saved, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
-}
 
-func (s *providerStore) upsert(req providerUpsertRequest) (providerPublic, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	req.ID = strings.TrimSpace(req.ID)
-	req.Name = strings.TrimSpace(req.Name)
-	req.BaseURL = strings.TrimSpace(req.BaseURL)
-	req.Model = strings.TrimSpace(req.Model)
-	if req.Name == "" || req.BaseURL == "" || req.Model == "" {
-		return providerPublic{}, errors.New("name, base_url, and model are required")
-	}
-	if _, err := normalizeChatEndpoint(req.BaseURL); err != nil {
-		return providerPublic{}, err
-	}
-	if req.ID == "" {
-		req.ID = fmt.Sprintf("provider-%d", time.Now().UTC().UnixMilli())
-	}
-	old, exists := s.items[req.ID]
-	now := time.Now().UTC().Format(time.RFC3339)
-	encKey := old.EncryptedAPIKey
-	if strings.TrimSpace(req.APIKey) != "" {
-		encrypted, err := encryptString(strings.TrimSpace(req.APIKey), s.key)
+	// ── GitHub OAuth — step 1: redirect ──────────────────────────────────────
+	// GET /api/auth/github
+	mux.HandleFunc("/api/auth/github", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.GitHubClientID == "" {
+			writeError(w, http.StatusServiceUnavailable, "oauth_not_configured", "GITHUB_CLIENT_ID not configured")
+			return
+		}
+		redirectURI := strings.TrimRight(appBaseURL(r), "/") + "/api/auth/github/callback"
+		authURL := fmt.Sprintf(
+			"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo&state=zpwu",
+			url.QueryEscape(cfg.GitHubClientID),
+			url.QueryEscape(redirectURI),
+		)
+		http.Redirect(w, r, authURL, http.StatusFound)
+	})
+
+	// ── GitHub OAuth — step 2: callback ──────────────────────────────────────
+	// GET /api/auth/github/callback
+	mux.HandleFunc("/api/auth/github/callback", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.GitHubClientID == "" || cfg.GitHubSecret == "" {
+			writeError(w, http.StatusServiceUnavailable, "oauth_not_configured", "OAuth not configured")
+			return
+		}
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			writeError(w, http.StatusBadRequest, "missing_code", "missing OAuth code")
+			return
+		}
+		// exchange code for token
+		tokenBody, _ := json.Marshal(jsonResponse{
+			"client_id":     cfg.GitHubClientID,
+			"client_secret": cfg.GitHubSecret,
+			"code":          code,
+		})
+		tokenReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+			"https://github.com/login/oauth/access_token", bytes.NewReader(tokenBody))
 		if err != nil {
-			return providerPublic{}, errors.New("encrypt api key failed")
+			writeError(w, http.StatusInternalServerError, "token_exchange_failed", "build token request failed")
+			return
 		}
-		encKey = encrypted
-	}
-	if encKey == "" {
-		return providerPublic{}, errors.New("api_key is required for new provider")
-	}
-	record := providerRecord{
-		ID:              req.ID,
-		Name:            req.Name,
-		BaseURL:         strings.TrimRight(req.BaseURL, "/"),
-		Model:           req.Model,
-		Headers:         cloneMap(req.Headers),
-		EncryptedAPIKey: encKey,
-		MaskedKey:       old.MaskedKey,
-		CreatedAt:       old.CreatedAt,
-		UpdatedAt:       now,
-		LastUsedAt:      old.LastUsedAt,
-	}
-	if strings.TrimSpace(req.APIKey) != "" {
-		record.MaskedKey = maskSecret(strings.TrimSpace(req.APIKey))
-	}
-	if !exists || record.CreatedAt == "" {
-		record.CreatedAt = now
-	}
-	s.items[record.ID] = record
-	if req.Active || s.activeID == "" {
-		s.activeID = record.ID
-	}
-	if err := s.persist(); err != nil {
-		return providerPublic{}, err
-	}
-	return s.toPublic(record), nil
-}
-
-func (s *providerStore) setActive(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.items[id]; !ok {
-		return errors.New("provider not found")
-	}
-	s.activeID = id
-	return s.persist()
-}
-
-func (s *providerStore) markUsed(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	item, ok := s.items[id]
-	if !ok {
-		return
-	}
-	item.LastUsedAt = time.Now().UTC().Format(time.RFC3339)
-	item.UpdatedAt = item.LastUsedAt
-	s.items[id] = item
-	_ = s.persist()
-}
-
-func (s *providerStore) resolveProvider(providerID string) (providerForUse, error) {
-	s.mu.RLock()
-	id := strings.TrimSpace(providerID)
-	if id == "" {
-		id = s.activeID
-	}
-	item, ok := s.items[id]
-	key := s.key
-	s.mu.RUnlock()
-	if !ok {
-		return providerForUse{}, errors.New("active provider is not configured")
-	}
-	apiKey, err := decryptString(item.EncryptedAPIKey, key)
-	if err != nil {
-		return providerForUse{}, errors.New("provider api key decrypt failed")
-	}
-	return providerForUse{
-		ID:      item.ID,
-		Name:    item.Name,
-		BaseURL: item.BaseURL,
-		Model:   item.Model,
-		APIKey:  apiKey,
-		Headers: cloneMap(item.Headers),
-	}, nil
-}
-
-func (s *providerStore) listPublic() []providerPublic {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	result := make([]providerPublic, 0, len(s.items))
-	for _, item := range s.items {
-		pub := s.toPublic(item)
-		result = append(result, pub)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].UpdatedAt > result[j].UpdatedAt
+		tokenReq.Header.Set("Accept", "application/json")
+		tokenReq.Header.Set("Content-Type", "application/json")
+		tokenResp, err := ghClient.Do(tokenReq)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "token_exchange_failed", "token exchange request failed")
+			return
+		}
+		defer tokenResp.Body.Close()
+		var tokenData struct {
+			AccessToken string `json:"access_token"`
+			Scope       string `json:"scope"`
+			Error       string `json:"error"`
+		}
+		raw, _ := io.ReadAll(io.LimitReader(tokenResp.Body, 1<<20))
+		if err := json.Unmarshal(raw, &tokenData); err != nil || tokenData.AccessToken == "" {
+			msg := tokenData.Error
+			if msg == "" {
+				msg = "empty access token"
+			}
+			writeError(w, http.StatusBadGateway, "token_exchange_failed", msg)
+			return
+		}
+		// fetch user info
+		// URL is hardcoded so NewRequestWithContext will never fail; _ is intentional.
+		userReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, "https://api.github.com/user", nil)
+		userReq.Header.Set("Authorization", "Bearer "+tokenData.AccessToken)
+		userReq.Header.Set("Accept", "application/vnd.github+json")
+		userReq.Header.Set("User-Agent", "ZPWU-CODE-agent")
+		userResp, err := ghClient.Do(userReq)
+		var login, avatarURL string
+		if err == nil {
+			defer userResp.Body.Close()
+			var ud struct {
+				Login     string `json:"login"`
+				AvatarURL string `json:"avatar_url"`
+			}
+			rawU, _ := io.ReadAll(io.LimitReader(userResp.Body, 1<<20))
+			_ = json.Unmarshal(rawU, &ud)
+			login = ud.Login
+			avatarURL = ud.AvatarURL
+		}
+		// Pass token back to browser via a tiny HTML page that stores it in localStorage
+		// and redirects to root. This avoids token appearing in URL fragment leaks.
+		escapedToken := template_jsString(tokenData.AccessToken)
+		escapedLogin := template_jsString(login)
+		escapedAvatar := template_jsString(avatarURL)
+		html := fmt.Sprintf(`<!doctype html><html><head><meta charset="UTF-8">
+<title>ZPWU — 登录中...</title></head><body>
+<script>
+try {
+  var d = JSON.parse(localStorage.getItem('zpwu_config') || '{}');
+  d.githubToken = %s;
+  d.githubLogin = %s;
+  d.githubAvatar = %s;
+  localStorage.setItem('zpwu_config', JSON.stringify(d));
+} catch(e) {}
+window.location.replace('/');
+</script>
+<p>登录成功，正在跳转...</p>
+</body></html>`, escapedToken, escapedLogin, escapedAvatar)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(html))
 	})
-	return result
-}
 
-func (s *providerStore) toPublic(item providerRecord) providerPublic {
-	return providerPublic{
-		ID:         item.ID,
-		Name:       item.Name,
-		BaseURL:    item.BaseURL,
-		Model:      item.Model,
-		Headers:    cloneMap(item.Headers),
-		MaskedKey:  item.MaskedKey,
-		Active:     item.ID == s.activeID,
-		CreatedAt:  item.CreatedAt,
-		UpdatedAt:  item.UpdatedAt,
-		LastUsedAt: item.LastUsedAt,
-	}
-}
-
-func (s *providerStore) hasAny() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.items) > 0
-}
-
-func (s *providerStore) activeProviderID() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.activeID
-}
-
-func cloneMap(m map[string]string) map[string]string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
-	}
-	return out
-}
-
-func encryptString(plain string, key []byte) (string, error) {
-	block, err := aes.NewCipher(key[:32])
-	if err != nil {
-		return "", err
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	nonce := make([]byte, aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return "", err
-	}
-	ciphertext := aead.Seal(nil, nonce, []byte(plain), nil)
-	all := append(nonce, ciphertext...)
-	return base64.StdEncoding.EncodeToString(all), nil
-}
-
-func decryptString(encrypted string, key []byte) (string, error) {
-	raw, err := base64.StdEncoding.DecodeString(encrypted)
-	if err != nil {
-		return "", err
-	}
-	block, err := aes.NewCipher(key[:32])
-	if err != nil {
-		return "", err
-	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-	size := aead.NonceSize()
-	if len(raw) <= size {
-		return "", errors.New("encrypted payload is invalid")
-	}
-	nonce, ciphertext := raw[:size], raw[size:]
-	plain, err := aead.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return "", err
-	}
-	return string(plain), nil
-}
-
-func maskSecret(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	if len(raw) < 10 {
-		return "****"
-	}
-	return raw[:4] + "..." + raw[len(raw)-4:]
-}
-
-func newTaskStore() *taskStore {
-	return &taskStore{
-		items: make(map[string]*taskRecord),
-	}
-}
-
-func (s *taskStore) create(taskType string, input any) *taskRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC().Format(time.RFC3339)
-	id := fmt.Sprintf("task-%d-%d", time.Now().UTC().UnixMilli(), s.seq.Add(1))
-	task := &taskRecord{
-		ID:        id,
-		Type:      taskType,
-		Status:    taskQueued,
-		CreatedAt: now,
-		UpdatedAt: now,
-		Input:     input,
-	}
-	s.items[id] = task
-	s.order = append([]string{id}, s.order...)
-	const maxTrackedTasks = 100
-	if len(s.order) > maxTrackedTasks {
-		kept := make([]string, 0, len(s.order))
-		for _, taskID := range s.order {
-			if len(kept) < maxTrackedTasks {
-				kept = append(kept, taskID)
-				continue
-			}
-			staleTask, ok := s.items[taskID]
-			if !ok {
-				continue
-			}
-			if staleTask.Status == taskCompleted || staleTask.Status == taskFailed {
-				delete(s.items, taskID)
-				continue
-			}
-			kept = append(kept, taskID)
+	// ── GitHub user info (verify token) ──────────────────────────────────────
+	// GET /api/auth/user  (X-GitHub-Token header)
+	mux.HandleFunc("/api/auth/user", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
 		}
-		s.order = kept
-	}
-	return cloneTask(task)
-}
-
-func (s *taskStore) running(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	task, ok := s.items[id]
-	if !ok {
-		return
-	}
-	task.Status = taskRunning
-	task.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-}
-
-func (s *taskStore) complete(id string, result any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	task, ok := s.items[id]
-	if !ok {
-		return
-	}
-	task.Status = taskCompleted
-	task.Result = result
-	task.Error = nil
-	task.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-}
-
-func (s *taskStore) fail(id, code, message string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	task, ok := s.items[id]
-	if !ok {
-		return
-	}
-	task.Status = taskFailed
-	task.Error = &taskError{
-		Code:    code,
-		Message: message,
-	}
-	task.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-}
-
-func (s *taskStore) get(id string) (*taskRecord, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	task, ok := s.items[id]
-	if !ok {
-		return nil, false
-	}
-	return cloneTask(task), true
-}
-
-func (s *taskStore) list(limit int) []jsonResponse {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if limit <= 0 {
-		limit = 20
-	}
-	out := make([]jsonResponse, 0, limit)
-	for _, id := range s.order {
-		if len(out) >= limit {
-			break
+		token := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "missing_token", "X-GitHub-Token required")
+			return
 		}
-		task, ok := s.items[id]
+		httpReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, "https://api.github.com/user", nil)
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		httpReq.Header.Set("Accept", "application/vnd.github+json")
+		httpReq.Header.Set("User-Agent", "ZPWU-CODE-agent")
+		resp, err := ghClient.Do(httpReq)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "github_request_failed", err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode == http.StatusUnauthorized {
+			writeError(w, http.StatusUnauthorized, "invalid_token", "GitHub token is invalid or expired")
+			return
+		}
+		var ud struct {
+			Login     string `json:"login"`
+			AvatarURL string `json:"avatar_url"`
+			Name      string `json:"name"`
+		}
+		_ = json.Unmarshal(raw, &ud)
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"login":      ud.Login,
+			"name":       ud.Name,
+			"avatar_url": ud.AvatarURL,
+		})
+	})
+
+	// ── List user repos ───────────────────────────────────────────────────────
+	// GET /api/auth/repos
+	mux.HandleFunc("/api/auth/repos", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		token := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "missing_token", "X-GitHub-Token required")
+			return
+		}
+		apiURL := "https://api.github.com/user/repos?sort=updated&per_page=50&type=all"
+		httpReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, apiURL, nil)
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		httpReq.Header.Set("Accept", "application/vnd.github+json")
+		httpReq.Header.Set("User-Agent", "ZPWU-CODE-agent")
+		resp, err := ghClient.Do(httpReq)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "github_request_failed", err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			writeError(w, http.StatusBadGateway, "github_read_failed", safeSnippet(string(raw)))
+			return
+		}
+		var repos []struct {
+			FullName      string `json:"full_name"`
+			DefaultBranch string `json:"default_branch"`
+			Private       bool   `json:"private"`
+		}
+		if err := json.Unmarshal(raw, &repos); err != nil {
+			writeError(w, http.StatusBadGateway, "parse_failed", "parse repos failed")
+			return
+		}
+		out := make([]jsonResponse, 0, len(repos))
+		for _, r := range repos {
+			out = append(out, jsonResponse{
+				"full_name":      r.FullName,
+				"default_branch": r.DefaultBranch,
+				"private":        r.Private,
+			})
+		}
+		writeJSON(w, http.StatusOK, jsonResponse{"repos": out})
+	})
+
+	// ── Tasks ─────────────────────────────────────────────────────────────────
+	mux.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		writeJSON(w, http.StatusOK, jsonResponse{"tasks": tasks.list(20)})
+	})
+
+	mux.HandleFunc("/api/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+		if id == "" {
+			writeError(w, http.StatusBadRequest, "invalid_task_id", "task id is required")
+			return
+		}
+		task, ok := tasks.get(id)
 		if !ok {
-			continue
+			writeError(w, http.StatusNotFound, "task_not_found", "task not found")
+			return
 		}
-		out = append(out, taskToResponse(task))
-	}
-	return out
+		writeJSON(w, http.StatusOK, taskToResponse(task))
+	})
+
+	// ── Chat ──────────────────────────────────────────────────────────────────
+	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		var req chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
+			return
+		}
+		if strings.TrimSpace(req.Message) == "" {
+			writeError(w, http.StatusBadRequest, "invalid_message", "message is required")
+			return
+		}
+		if strings.TrimSpace(req.Provider.APIKey) == "" {
+			writeError(w, http.StatusBadRequest, "missing_provider", "provider.api_key is required")
+			return
+		}
+		task := tasks.create("chat", jsonResponse{
+			"agent":    fallback(req.Agent, "default"),
+			"provider": req.Provider.Name,
+			"model":    req.Provider.Model,
+			"kind":     req.Provider.Kind,
+		})
+		writeJSON(w, http.StatusAccepted, jsonResponse{"task_id": task.ID, "status": task.Status})
+
+		go func(taskID string, request chatRequest) {
+			tasks.running(taskID)
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			reply, usage, err := gateway.chat(ctx, request)
+			if err != nil {
+				tasks.fail(taskID, "upstream_chat_failed", err.Error())
+				return
+			}
+			tasks.complete(taskID, jsonResponse{
+				"reply": reply,
+				"meta": jsonResponse{
+					"provider": request.Provider.Name,
+					"model":    request.Provider.Model,
+					"kind":     request.Provider.Kind,
+					"usage":    usage,
+				},
+			})
+		}(task.ID, req)
+	})
+
+	// ── Git sync (write file to GitHub) ──────────────────────────────────────
+	mux.HandleFunc("/api/git/sync", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		token := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "missing_github_token", "X-GitHub-Token header is required")
+			return
+		}
+		var req gitSyncRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
+			return
+		}
+		if req.Owner == "" || req.Repo == "" || req.FilePath == "" || req.CommitMessage == "" {
+			writeError(w, http.StatusBadRequest, "invalid_sync_request", "owner, repo, file_path and commit_message are required")
+			return
+		}
+		if req.Branch == "" {
+			req.Branch = "main"
+		}
+		task := tasks.create("git_sync", jsonResponse{
+			"repo": req.Owner + "/" + req.Repo, "branch": req.Branch, "path": req.FilePath,
+		})
+		writeJSON(w, http.StatusAccepted, jsonResponse{"task_id": task.ID, "status": task.Status})
+
+		go func(taskID string, request gitSyncRequest, ghToken string) {
+			tasks.running(taskID)
+			result, code, err := syncToGitHub(context.Background(), ghToken, request)
+			if err != nil {
+				tasks.fail(taskID, code, err.Error())
+				return
+			}
+			tasks.complete(taskID, result)
+		}(task.ID, req, token)
+	})
+
+	// ── List directory on GitHub ──────────────────────────────────────────────
+	// GET /api/git/files?owner=&repo=&branch=&path=
+	mux.HandleFunc("/api/git/files", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		token := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "missing_github_token", "X-GitHub-Token required")
+			return
+		}
+		q := r.URL.Query()
+		owner := strings.TrimSpace(q.Get("owner"))
+		repo := strings.TrimSpace(q.Get("repo"))
+		branch := fallback(strings.TrimSpace(q.Get("branch")), "main")
+		dirPath := strings.TrimSpace(strings.TrimPrefix(q.Get("path"), "/"))
+		if owner == "" || repo == "" {
+			writeError(w, http.StatusBadRequest, "missing_params", "owner and repo are required")
+			return
+		}
+		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s",
+			url.PathEscape(owner), url.PathEscape(repo),
+			escapeGitHubContentPath(dirPath), url.QueryEscape(branch))
+
+		httpReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, apiURL, nil)
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		httpReq.Header.Set("Accept", "application/vnd.github+json")
+		httpReq.Header.Set("User-Agent", "ZPWU-CODE-agent")
+		resp, err := ghClient.Do(httpReq)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "github_request_failed", err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if resp.StatusCode == http.StatusNotFound {
+			writeError(w, http.StatusNotFound, "path_not_found", "path not found in repository")
+			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			writeError(w, http.StatusBadGateway, "github_read_failed", safeSnippet(string(raw)))
+			return
+		}
+		var entries []gitDirEntry
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			var single gitDirEntry
+			if err2 := json.Unmarshal(raw, &single); err2 != nil {
+				writeError(w, http.StatusBadGateway, "parse_failed", "parse github response failed")
+				return
+			}
+			entries = []gitDirEntry{single}
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Type != entries[j].Type {
+				return entries[i].Type == "dir"
+			}
+			return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+		})
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"path": dirPath, "owner": owner, "repo": repo, "branch": branch, "entries": entries,
+		})
+	})
+
+	// ── Read file from GitHub ─────────────────────────────────────────────────
+	// GET /api/git/file?owner=&repo=&branch=&path=
+	mux.HandleFunc("/api/git/file", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		token := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "missing_github_token", "X-GitHub-Token required")
+			return
+		}
+		q := r.URL.Query()
+		owner := strings.TrimSpace(q.Get("owner"))
+		repo := strings.TrimSpace(q.Get("repo"))
+		branch := fallback(strings.TrimSpace(q.Get("branch")), "main")
+		filePath := strings.TrimSpace(strings.TrimPrefix(q.Get("path"), "/"))
+		if owner == "" || repo == "" || filePath == "" {
+			writeError(w, http.StatusBadRequest, "missing_params", "owner, repo and path are required")
+			return
+		}
+		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s",
+			url.PathEscape(owner), url.PathEscape(repo),
+			escapeGitHubContentPath(filePath), url.QueryEscape(branch))
+
+		httpReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, apiURL, nil)
+		httpReq.Header.Set("Authorization", "Bearer "+token)
+		httpReq.Header.Set("Accept", "application/vnd.github+json")
+		httpReq.Header.Set("User-Agent", "ZPWU-CODE-agent")
+		resp, err := ghClient.Do(httpReq)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "github_request_failed", err.Error())
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if resp.StatusCode == http.StatusNotFound {
+			writeError(w, http.StatusNotFound, "file_not_found", "file not found in repository")
+			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			writeError(w, http.StatusBadGateway, "github_read_failed", safeSnippet(string(raw)))
+			return
+		}
+		var ghFile struct {
+			Name    string `json:"name"`
+			Path    string `json:"path"`
+			SHA     string `json:"sha"`
+			Size    int    `json:"size"`
+			HTMLURL string `json:"html_url"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(raw, &ghFile); err != nil {
+			writeError(w, http.StatusBadGateway, "parse_failed", "parse github response failed")
+			return
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(ghFile.Content, "\n", ""))
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "decode_failed", "base64 decode failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, jsonResponse{
+			"file": gitFileReadResult{
+				Name: ghFile.Name, Path: ghFile.Path,
+				Content: string(decoded), SHA: ghFile.SHA,
+				Size: ghFile.Size, HTMLURL: ghFile.HTMLURL,
+			},
+		})
+	})
+
+	// ── Agent run (SSE) ───────────────────────────────────────────────────────
+	// POST /api/agent/run  →  text/event-stream
+	mux.HandleFunc("/api/agent/run", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		ghToken := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if ghToken == "" {
+			writeError(w, http.StatusUnauthorized, "missing_github_token", "X-GitHub-Token header is required")
+			return
+		}
+		var req agent.AgentHTTPRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
+			return
+		}
+		if strings.TrimSpace(req.Message) == "" {
+			writeError(w, http.StatusBadRequest, "missing_message", "message is required")
+			return
+		}
+		if strings.TrimSpace(req.Provider.APIKey) == "" {
+			writeError(w, http.StatusBadRequest, "missing_api_key", "provider.api_key is required")
+			return
+		}
+		// #fix6: enforce minimum token length to prevent trivially-forged tokens
+		// when APP_ACCESS_TOKEN is not set (open deployment)
+		if len(ghToken) < 10 {
+			writeError(w, http.StatusUnauthorized, "invalid_github_token", "X-GitHub-Token appears invalid (too short)")
+			return
+		}
+		if req.Owner == "" || req.Repo == "" {
+			writeError(w, http.StatusBadRequest, "missing_repo", "owner and repo are required")
+			return
+		}
+		emitter, ok := agent.NewSSEEmitter(w)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "sse_not_supported", "SSE not supported by this transport")
+			return
+		}
+		runReq := req.BuildRunRequest(ghToken)
+		_, _ = agent.Run(r.Context(), runReq, emitter)
+	})
+
+	log.Println("routes registered (stateless mode — no disk storage)")
 }
 
-func cloneTask(task *taskRecord) *taskRecord {
-	copyTask := *task
-	if task.Error != nil {
-		errCopy := *task.Error
-		copyTask.Error = &errCopy
-	}
-	return &copyTask
-}
-
-func taskToResponse(task *taskRecord) jsonResponse {
-	res := jsonResponse{
-		"id":         task.ID,
-		"type":       task.Type,
-		"status":     task.Status,
-		"created_at": task.CreatedAt,
-		"updated_at": task.UpdatedAt,
-	}
-	if task.Input != nil {
-		res["input"] = task.Input
-	}
-	if task.Result != nil {
-		res["result"] = task.Result
-	}
-	if task.Error != nil {
-		res["error"] = task.Error
-	}
-	return res
-}
-
-func safeSnippet(text string) string {
-	text = strings.TrimSpace(text)
-	if len(text) > 240 {
-		text = text[:240] + "..."
-	}
-	return text
-}
+// ─── Utility ─────────────────────────────────────────────────────────────────
 
 func authorizeRequest(w http.ResponseWriter, r *http.Request, expectedToken string) bool {
 	expectedToken = strings.TrimSpace(expectedToken)
 	if expectedToken == "" {
-		writeError(w, http.StatusServiceUnavailable, "access_token_not_configured", "APP_ACCESS_TOKEN is required for protected endpoints")
-		return false
+		return true // no server-level token required; GitHub token protects data
 	}
 	actual := strings.TrimSpace(r.Header.Get("X-App-Token"))
 	if subtle.ConstantTimeCompare([]byte(actual), []byte(expectedToken)) != 1 {
@@ -1105,12 +1048,7 @@ func writeJSON(w http.ResponseWriter, status int, data jsonResponse) {
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, jsonResponse{
-		"error": jsonResponse{
-			"code":    code,
-			"message": message,
-		},
-	})
+	writeJSON(w, status, jsonResponse{"error": jsonResponse{"code": code, "message": message}})
 }
 
 func fallback(v, d string) string {
@@ -1118,4 +1056,29 @@ func fallback(v, d string) string {
 		return d
 	}
 	return v
+}
+
+func safeSnippet(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) > 240 {
+		text = text[:240] + "..."
+	}
+	return text
+}
+
+func appBaseURL(r *http.Request) string {
+	scheme := "https"
+	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") == "" {
+		scheme = "http"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+	return scheme + "://" + r.Host
+}
+
+// template_jsString safely encodes a Go string for embedding inside a JS string literal (single-quoted).
+func template_jsString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b) // json.Marshal produces a valid JS string literal with double quotes
 }
