@@ -81,16 +81,16 @@ func NormalizeOpenAIEndpoint(base string) (string, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", errors.New("base_url must be a valid absolute URL")
 	}
-	// Strip any trailing endpoint suffix so we always start from the base.
-	// TrimRight removes trailing slashes first, then we remove known suffixes.
+	// Strip trailing slashes and any known endpoint suffixes first.
 	trimmed := strings.TrimRight(base, "/")
 	trimmed = strings.TrimSuffix(trimmed, "/v1/chat/completions")
 	trimmed = strings.TrimSuffix(trimmed, "/chat/completions")
-	// Ensure exactly one /v1 segment
-	if !strings.HasSuffix(trimmed, "/v1") {
-		trimmed = trimmed + "/v1"
+	// Trim everything after the last /v1 segment so that non-standard proxy
+	// paths like /proxy/v1/completions don't produce double /v1 segments.
+	if idx := strings.LastIndex(trimmed, "/v1"); idx != -1 {
+		trimmed = trimmed[:idx]
 	}
-	return trimmed + "/chat/completions", nil
+	return trimmed + "/v1/chat/completions", nil
 }
 
 // ─── Agent Loop ───────────────────────────────────────────────────────────────
