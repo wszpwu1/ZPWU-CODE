@@ -426,7 +426,12 @@ func sanitizePath(p string) string {
 	if p == "." || p == "" {
 		return ""
 	}
-	return filepath.ToSlash(filepath.Clean(p))
+	cleaned := filepath.ToSlash(filepath.Clean(p))
+	// Block path traversal: reject any path that escapes the repo root.
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return ""
+	}
+	return cleaned
 }
 
 func escapeContentPath(path string) string {

@@ -3,8 +3,10 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -524,11 +526,29 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 			writeError(w, http.StatusServiceUnavailable, "oauth_not_configured", "GITHUB_CLIENT_ID not configured")
 			return
 		}
+		// Generate a cryptographically random state token to prevent CSRF.
+		stateBytes := make([]byte, 16)
+		if _, err := rand.Read(stateBytes); err != nil {
+			writeError(w, http.StatusInternalServerError, "state_gen_failed", "failed to generate OAuth state")
+			return
+		}
+		state := hex.EncodeToString(stateBytes)
+		secure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+		http.SetCookie(w, &http.Cookie{
+			Name:     "oauth_state",
+			Value:    state,
+			Path:     "/",
+			MaxAge:   300, // 5 minutes
+			HttpOnly: true,
+			Secure:   secure,
+			SameSite: http.SameSiteLaxMode,
+		})
 		redirectURI := strings.TrimRight(appBaseURL(r), "/") + "/api/auth/github/callback"
 		authURL := fmt.Sprintf(
-			"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo&state=zpwu",
+			"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo&state=%s",
 			url.QueryEscape(cfg.GitHubClientID),
 			url.QueryEscape(redirectURI),
+			url.QueryEscape(state),
 		)
 		http.Redirect(w, r, authURL, http.StatusFound)
 	})
@@ -540,6 +560,22 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 			writeError(w, http.StatusServiceUnavailable, "oauth_not_configured", "OAuth not configured")
 			return
 		}
+		// Validate the state parameter against the cookie to prevent CSRF.
+		returnedState := r.URL.Query().Get("state")
+		stateCookie, cookieErr := r.Cookie("oauth_state")
+		if cookieErr != nil || returnedState == "" || subtle.ConstantTimeCompare([]byte(returnedState), []byte(stateCookie.Value)) != 1 {
+			writeError(w, http.StatusBadRequest, "invalid_state", "OAuth state mismatch")
+			return
+		}
+		// Clear the state cookie.
+		http.SetCookie(w, &http.Cookie{
+			Name:     "oauth_state",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
+		})
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			writeError(w, http.StatusBadRequest, "missing_code", "missing OAuth code")
