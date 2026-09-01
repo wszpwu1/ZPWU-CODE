@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f172a" />
+    <title>ZPWU-CODE 控制台</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>ZPWU-CODE 控制台（简易框架）</h1>
+
+      <section class="card">
+        <h2>连接状态</h2>
+        <p id="health">未检测</p>
+        <button id="checkHealth">检查健康状态</button>
+      </section>
+
+      <section class="card">
+        <h2>对话</h2>
+        <label>Agent 名称 <input id="agent" value="default" /></label>
+        <label>API Key（仅当前页面内存暂存） <input id="apiKey" type="password" placeholder="sk-..." /></label>
+        <label>消息 <textarea id="message" rows="4" placeholder="输入你的问题"></textarea></label>
+        <button id="sendChat">发送</button>
+        <pre id="chatResult"></pre>
+      </section>
+
+      <section class="card">
+        <h2>Git 同步</h2>
+        <button id="syncGit">触发同步</button>
+        <pre id="syncResult"></pre>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
