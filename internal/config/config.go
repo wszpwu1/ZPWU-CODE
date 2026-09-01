@@ -9,6 +9,7 @@ type Config struct {
 	RepoBranch        string
 	ProviderStorePath string
 	EncryptionKey     string
+	AccessToken       string
 }
 
 func Load() Config {
@@ -18,7 +19,8 @@ func Load() Config {
 		RepoName:          getEnv("GITHUB_REPO_NAME", "ZPWU-CODE"),
 		RepoBranch:        getEnv("GITHUB_REPO_BRANCH", "main"),
 		ProviderStorePath: getEnv("PROVIDER_STORE_PATH", "data/providers.json"),
-		EncryptionKey:     getEnv("APP_ENCRYPTION_KEY", "dev-only-change-me"),
+		EncryptionKey:     getEnv("APP_ENCRYPTION_KEY", ""),
+		AccessToken:       getEnv("APP_ACCESS_TOKEN", ""),
 	}
 }
 

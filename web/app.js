@@ -6,7 +6,12 @@ const taskResult = document.getElementById('taskResult');
 const activeProviderSelect = document.getElementById('activeProviderSelect');
 
 async function apiRequest(url, options = {}) {
-  const res = await fetch(url, options);
+  const appToken = document.getElementById('appToken').value.trim();
+  const headers = new Headers(options.headers || {});
+  if (appToken) {
+    headers.set('X-App-Token', appToken);
+  }
+  const res = await fetch(url, { ...options, headers });
   let data = {};
   try {
     data = await res.json();

@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wszpwu1/ZPWU-CODE/internal/config"
@@ -67,6 +69,7 @@ type providerRecord struct {
 	Model           string            `json:"model"`
 	Headers         map[string]string `json:"headers"`
 	EncryptedAPIKey string            `json:"encrypted_api_key"`
+	MaskedKey       string            `json:"masked_key"`
 	CreatedAt       string            `json:"created_at"`
 	UpdatedAt       string            `json:"updated_at"`
 	LastUsedAt      string            `json:"last_used_at,omitempty"`
@@ -123,6 +126,7 @@ type taskStore struct {
 	mu    sync.RWMutex
 	items map[string]*taskRecord
 	order []string
+	seq   atomic.Uint64
 }
 
 type gitSyncRequest struct {
@@ -183,6 +187,9 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	})
 
 	mux.HandleFunc("/api/providers", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
 		if providers == nil {
 			writeError(w, http.StatusServiceUnavailable, "provider_store_unavailable", "provider store is unavailable")
 			return
@@ -213,6 +220,9 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	})
 
 	mux.HandleFunc("/api/providers/active", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
 		if providers == nil {
 			writeError(w, http.StatusServiceUnavailable, "provider_store_unavailable", "provider store is unavailable")
 			return
@@ -236,6 +246,9 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	})
 
 	mux.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
@@ -246,6 +259,9 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	})
 
 	mux.HandleFunc("/api/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
@@ -264,6 +280,9 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	})
 
 	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
@@ -321,6 +340,9 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	})
 
 	mux.HandleFunc("/api/exec/validate", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
@@ -337,6 +359,9 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	})
 
 	mux.HandleFunc("/api/git/sync", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
@@ -463,7 +488,7 @@ func syncToGitHub(ctx context.Context, token string, req gitSyncRequest) (gitCom
 	}
 
 	client := &http.Client{Timeout: 45 * time.Second}
-	baseURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", req.Owner, req.Repo, url.PathEscape(safePath))
+	baseURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", req.Owner, req.Repo, escapeGitHubContentPath(safePath))
 	existingSHA, readCode, readErr := readContentSHA(ctx, client, token, baseURL, req.Branch)
 	if readErr != nil && readCode != "github_content_not_found" {
 		return gitCommitResult{}, readCode, readErr
@@ -560,6 +585,14 @@ func sanitizeRepoPath(input string) (string, error) {
 	return cleaned, nil
 }
 
+func escapeGitHubContentPath(path string) string {
+	parts := strings.Split(path, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
+}
+
 func validateCommands(commands, paths []string) commandValidationResult {
 	allowedPrefixes := []string{
 		"go test", "go run", "go fmt", "git status", "git diff", "git add", "git commit", "npm run", "npm test", "ls", "cat",
@@ -630,6 +663,9 @@ func dedup(values []string) []string {
 }
 
 func newProviderStore(path, encryptionKey string) (*providerStore, error) {
+	if len(strings.TrimSpace(encryptionKey)) < 16 {
+		return nil, errors.New("APP_ENCRYPTION_KEY must be set and at least 16 characters")
+	}
 	sum := sha256.Sum256([]byte(encryptionKey))
 	store := &providerStore{
 		path:  path,
@@ -723,9 +759,13 @@ func (s *providerStore) upsert(req providerUpsertRequest) (providerPublic, error
 		Model:           req.Model,
 		Headers:         cloneMap(req.Headers),
 		EncryptedAPIKey: encKey,
+		MaskedKey:       old.MaskedKey,
 		CreatedAt:       old.CreatedAt,
 		UpdatedAt:       now,
 		LastUsedAt:      old.LastUsedAt,
+	}
+	if strings.TrimSpace(req.APIKey) != "" {
+		record.MaskedKey = maskSecret(strings.TrimSpace(req.APIKey))
 	}
 	if !exists || record.CreatedAt == "" {
 		record.CreatedAt = now
@@ -810,7 +850,7 @@ func (s *providerStore) toPublic(item providerRecord) providerPublic {
 		BaseURL:    item.BaseURL,
 		Model:      item.Model,
 		Headers:    cloneMap(item.Headers),
-		MaskedKey:  maskSecret(item.EncryptedAPIKey),
+		MaskedKey:  item.MaskedKey,
 		Active:     item.ID == s.activeID,
 		CreatedAt:  item.CreatedAt,
 		UpdatedAt:  item.UpdatedAt,
@@ -904,7 +944,7 @@ func (s *taskStore) create(taskType string, input any) *taskRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC().Format(time.RFC3339)
-	id := fmt.Sprintf("task-%d", time.Now().UTC().UnixMilli())
+	id := fmt.Sprintf("task-%d-%d", time.Now().UTC().UnixMilli(), s.seq.Add(1))
 	task := &taskRecord{
 		ID:        id,
 		Type:      taskType,
@@ -915,8 +955,25 @@ func (s *taskStore) create(taskType string, input any) *taskRecord {
 	}
 	s.items[id] = task
 	s.order = append([]string{id}, s.order...)
-	if len(s.order) > 100 {
-		s.order = s.order[:100]
+	const maxTrackedTasks = 100
+	if len(s.order) > maxTrackedTasks {
+		kept := make([]string, 0, len(s.order))
+		for _, taskID := range s.order {
+			if len(kept) < maxTrackedTasks {
+				kept = append(kept, taskID)
+				continue
+			}
+			staleTask, ok := s.items[taskID]
+			if !ok {
+				continue
+			}
+			if staleTask.Status == taskCompleted || staleTask.Status == taskFailed {
+				delete(s.items, taskID)
+				continue
+			}
+			kept = append(kept, taskID)
+		}
+		s.order = kept
 	}
 	return cloneTask(task)
 }
@@ -1025,6 +1082,20 @@ func safeSnippet(text string) string {
 		text = text[:240] + "..."
 	}
 	return text
+}
+
+func authorizeRequest(w http.ResponseWriter, r *http.Request, expectedToken string) bool {
+	expectedToken = strings.TrimSpace(expectedToken)
+	if expectedToken == "" {
+		writeError(w, http.StatusServiceUnavailable, "access_token_not_configured", "APP_ACCESS_TOKEN is required for protected endpoints")
+		return false
+	}
+	actual := strings.TrimSpace(r.Header.Get("X-App-Token"))
+	if subtle.ConstantTimeCompare([]byte(actual), []byte(expectedToken)) != 1 {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "invalid X-App-Token")
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, data jsonResponse) {

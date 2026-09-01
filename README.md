@@ -39,12 +39,15 @@ go run ./cmd/server
 - `GITHUB_REPO_NAME`
 - `GITHUB_REPO_BRANCH`
 - `PROVIDER_STORE_PATH`
-- `APP_ENCRYPTION_KEY`
+- `APP_ENCRYPTION_KEY`（必填，至少 16 位）
+- `APP_ACCESS_TOKEN`（必填，接口需通过 `X-App-Token` 访问）
 
 ## API 使用说明（MVP）
 
 ### 1) 配置模型提供商
 `POST /api/providers`
+
+请求头需带 `X-App-Token: <APP_ACCESS_TOKEN>`。
 
 ```json
 {
@@ -62,6 +65,8 @@ go run ./cmd/server
 ### 2) 提交聊天任务
 `POST /api/chat`
 
+请求头需带 `X-App-Token: <APP_ACCESS_TOKEN>`。
+
 ```json
 {
   "agent": "mobile-dev",
@@ -73,7 +78,7 @@ go run ./cmd/server
 响应为 `202`，返回 `task_id`，再通过 `GET /api/tasks/{id}` 轮询。
 
 ### 3) 同步内容到 GitHub
-`POST /api/git/sync`（请求头需带 `X-GitHub-Token`）
+`POST /api/git/sync`（请求头需带 `X-App-Token` 与 `X-GitHub-Token`）
 
 ```json
 {
@@ -89,6 +94,8 @@ go run ./cmd/server
 ## 安全说明（MVP）
 
 - Provider API Key 在服务端 AES-GCM 加密后落盘（`PROVIDER_STORE_PATH`）。
+- 未设置有效 `APP_ENCRYPTION_KEY`（<16 位）时，服务会禁用 provider 存储能力。
+- 所有受保护接口要求 `X-App-Token`，用于最小访问控制。
 - API Key 不在读取接口明文回显。
 - GitHub Token 仅从请求头读取，不持久化。
 - 提供 `POST /api/exec/validate` 用于命令白名单与敏感路径拦截。
