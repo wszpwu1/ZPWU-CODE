@@ -507,9 +507,16 @@ type approvalStore struct {
 }
 
 type approvalEntry struct {
-	ch        chan agent.ApprovalDecision
+	ch         chan agent.ApprovalDecision
 	ownerLogin string
 }
+
+var (
+	errApprovalPending        = errors.New("approval already pending for this call_id")
+	errApprovalNotFound       = errors.New("approval not found")
+	errApprovalForbidden      = errors.New("approval does not belong to this user")
+	errApprovalAlreadyDecided = errors.New("approval already decided")
+)
 
 func newApprovalStore() *approvalStore {
 	return &approvalStore{chans: make(map[string]approvalEntry)}
@@ -520,7 +527,7 @@ func (a *approvalStore) begin(callID, ownerLogin string) (chan agent.ApprovalDec
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, exists := a.chans[callID]; exists {
-		return nil, errors.New("approval already pending for this call_id")
+		return nil, errApprovalPending
 	}
 	a.chans[callID] = approvalEntry{ch: ch, ownerLogin: ownerLogin}
 	return ch, nil
@@ -548,16 +555,16 @@ func (a *approvalStore) decide(callID, login string, d agent.ApprovalDecision) e
 	entry, ok := a.chans[callID]
 	a.mu.Unlock()
 	if !ok {
-		return errors.New("approval not found")
+		return errApprovalNotFound
 	}
 	if entry.ownerLogin != "" && entry.ownerLogin != login {
-		return errors.New("approval does not belong to this user")
+		return errApprovalForbidden
 	}
 	select {
 	case entry.ch <- d:
 		return nil
 	default:
-		return errors.New("approval already decided")
+		return errApprovalAlreadyDecided
 	}
 }
 
@@ -1324,12 +1331,12 @@ window.location.replace('/');
 			Reason:   body.Reason,
 		})
 		if err != nil {
-			switch err.Error() {
-			case "approval not found":
+			switch {
+			case errors.Is(err, errApprovalNotFound):
 				writeError(w, http.StatusNotFound, "approval_not_found", "no pending approval for this call_id")
-			case "approval does not belong to this user":
+			case errors.Is(err, errApprovalForbidden):
 				writeError(w, http.StatusForbidden, "approval_forbidden", "you cannot approve another user's pending write")
-			case "approval already decided":
+			case errors.Is(err, errApprovalAlreadyDecided):
 				writeError(w, http.StatusConflict, "approval_already_decided", "approval already submitted for this call_id")
 			default:
 				writeError(w, http.StatusInternalServerError, "approval_failed", err.Error())
