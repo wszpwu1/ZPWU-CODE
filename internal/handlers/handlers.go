@@ -496,10 +496,205 @@ func normalizeChatEndpoint(base string) (string, error) {
 	return agent.NormalizeOpenAIEndpoint(base)
 }
 
+// ─── Approval Store (in-memory, keyed by call_id) ────────────────────────────
+
+// approvalStore holds pending approval channels keyed by tool call ID.
+// The agent SSE goroutine blocks on the channel; the /api/agent/approve
+// handler sends the decision.
+type approvalStore struct {
+	mu    sync.Mutex
+	chans map[string]chan agent.ApprovalDecision
+}
+
+func newApprovalStore() *approvalStore {
+	return &approvalStore{chans: make(map[string]chan agent.ApprovalDecision)}
+}
+
+// wait registers a channel for callID and blocks until a decision arrives
+// or ctx is done. Returns true if approved.
+func (a *approvalStore) wait(ctx context.Context, callID string) (bool, error) {
+	ch := make(chan agent.ApprovalDecision, 1)
+	a.mu.Lock()
+	a.chans[callID] = ch
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.chans, callID)
+		a.mu.Unlock()
+	}()
+	select {
+	case d := <-ch:
+		return d.Approved, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+// decide sends the user's decision for callID.
+func (a *approvalStore) decide(callID string, d agent.ApprovalDecision) bool {
+	a.mu.Lock()
+	ch, ok := a.chans[callID]
+	a.mu.Unlock()
+	if !ok {
+		return false
+	}
+	ch <- d
+	return true
+}
+
+// ─── SSEApprover — wires approvalStore + SSE emitter into agent.Approver ──────
+
+type sseApprover struct {
+	emitter agent.Emitter
+	store   *approvalStore
+}
+
+func (s *sseApprover) RequestApproval(ctx context.Context, callID, filePath, content, commitMsg string) (bool, error) {
+	// Truncate content for SSE preview — the full content is held in-memory by
+	// the executor and will be written to GitHub after approval.
+	// Sending megabytes over SSE would break the event stream.
+	const maxPreview = 4096
+	previewContent := content
+	if len(previewContent) > maxPreview {
+		previewContent = previewContent[:maxPreview] + "\n\n… (内容过长，已截断预览)"
+	}
+	// Emit the approval-request event; frontend will show an authorisation card.
+	s.emitter.Emit(agent.Event{
+		Type:          agent.EventApproval,
+		Tool:          "write_file",
+		CallID:        callID,
+		FilePath:      filePath,
+		CommitMessage: commitMsg,
+		Content:       previewContent,
+	})
+	// Block until the user responds via POST /api/agent/approve
+	return s.store.wait(ctx, callID)
+}
+
+// ─── Draft Store (in-memory, per GitHub-login) ───────────────────────────────
+
+type draftRecord struct {
+	ID              string `json:"id"`
+	Owner           string `json:"owner"`
+	Repo            string `json:"repo"`
+	Branch          string `json:"branch"`
+	FilePath        string `json:"file_path"`
+	OriginalContent string `json:"original_content"` // content before edit (from GitHub)
+	Content         string `json:"content"`          // edited content
+	CommitMessage   string `json:"commit_message"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+	Login           string `json:"login"` // GitHub login of author
+}
+
+type draftStore struct {
+	mu    sync.RWMutex
+	items map[string]*draftRecord // id → record
+	order []string                // newest-first insertion order
+	seq   atomic.Uint64
+}
+
+func newDraftStore() *draftStore {
+	return &draftStore{items: make(map[string]*draftRecord)}
+}
+
+func (d *draftStore) save(login, owner, repo, branch, filePath, originalContent, content, commitMsg string) *draftRecord {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Upsert: if a draft for the same login+repo+file already exists, overwrite it
+	for _, id := range d.order {
+		if r, ok := d.items[id]; ok &&
+			r.Login == login && r.Owner == owner && r.Repo == repo &&
+			r.Branch == branch && r.FilePath == filePath {
+			// Preserve original_content from first save; only update edited content
+			if r.OriginalContent == "" {
+				r.OriginalContent = originalContent
+			}
+			r.Content = content
+			r.CommitMessage = commitMsg
+			r.UpdatedAt = now
+			clone := *r
+			return &clone
+		}
+	}
+	id := fmt.Sprintf("draft-%d-%d", time.Now().UTC().UnixMilli(), d.seq.Add(1))
+	rec := &draftRecord{
+		ID: id, Owner: owner, Repo: repo, Branch: branch,
+		FilePath: filePath, OriginalContent: originalContent,
+		Content: content, CommitMessage: commitMsg,
+		CreatedAt: now, UpdatedAt: now, Login: login,
+	}
+	d.items[id] = rec
+	d.order = append([]string{id}, d.order...)
+	clone := *rec
+	return &clone
+}
+
+func (d *draftStore) list(login string) []draftRecord {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]draftRecord, 0)
+	for _, id := range d.order {
+		if r, ok := d.items[id]; ok && r.Login == login {
+			out = append(out, *r)
+		}
+	}
+	return out
+}
+
+func (d *draftStore) get(id, login string) (*draftRecord, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	r, ok := d.items[id]
+	if !ok || r.Login != login {
+		return nil, false
+	}
+	clone := *r
+	return &clone, true
+}
+
+func (d *draftStore) delete(id, login string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	r, ok := d.items[id]
+	if !ok || r.Login != login {
+		return false
+	}
+	delete(d.items, id)
+	newOrder := make([]string, 0, len(d.order))
+	for _, oid := range d.order {
+		if oid != id {
+			newOrder = append(newOrder, oid)
+		}
+	}
+	d.order = newOrder
+	return true
+}
+
+func (d *draftStore) deleteAll(login string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	newOrder := make([]string, 0, len(d.order))
+	for _, id := range d.order {
+		if r, ok := d.items[id]; ok && r.Login == login {
+			delete(d.items, id)
+			n++
+		} else {
+			newOrder = append(newOrder, id)
+		}
+	}
+	d.order = newOrder
+	return n
+}
+
 // ─── Route Registration ──────────────────────────────────────────────────────
 
 func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	tasks := newTaskStore()
+	drafts := newDraftStore()
+	approvals := newApprovalStore()
 	gateway := newLLMGateway()
 	ghClient := &http.Client{Timeout: 30 * time.Second}
 
@@ -1056,7 +1251,179 @@ window.location.replace('/');
 			return
 		}
 		runReq := req.BuildRunRequest(ghToken)
+		// Wire up user-approval gate for write_file tool calls
+		runReq.Approver = &sseApprover{emitter: emitter, store: approvals}
 		_, _ = agent.Run(r.Context(), runReq, emitter)
+	})
+
+	// ── Agent tool approval ────────────────────────────────────────────────
+	// POST /api/agent/approve  body: { "call_id": "...", "approved": true/false }
+	mux.HandleFunc("/api/agent/approve", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		var body struct {
+			CallID   string `json:"call_id"`
+			Approved bool   `json:"approved"`
+			Reason   string `json:"reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
+			return
+		}
+		if body.CallID == "" {
+			writeError(w, http.StatusBadRequest, "missing_call_id", "call_id is required")
+			return
+		}
+		ok2 := approvals.decide(body.CallID, agent.ApprovalDecision{
+			Approved: body.Approved,
+			Reason:   body.Reason,
+		})
+		if !ok2 {
+			writeError(w, http.StatusNotFound, "approval_not_found", "no pending approval for this call_id")
+			return
+		}
+		writeJSON(w, http.StatusOK, jsonResponse{"accepted": true, "approved": body.Approved})
+	})
+
+	// ── Draft: save / list / delete ──────────────────────────────────────────
+	// POST /api/drafts              — save (upsert) a draft
+	// GET  /api/drafts              — list current user's drafts
+	// DELETE /api/drafts?id=xxx     — delete one draft
+	// DELETE /api/drafts?all=1      — delete all drafts for current user
+	mux.HandleFunc("/api/drafts", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		// Identify the caller via GitHub token (reuse /api/auth/user logic)
+		ghToken := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if ghToken == "" {
+			writeError(w, http.StatusUnauthorized, "missing_github_token", "X-GitHub-Token header is required")
+			return
+		}
+		login, err := resolveGitHubLogin(r.Context(), ghToken, ghClient)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "github_token_invalid", "failed to resolve GitHub login: "+err.Error())
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPost:
+			var req struct {
+				Owner           string `json:"owner"`
+				Repo            string `json:"repo"`
+				Branch          string `json:"branch"`
+				FilePath        string `json:"file_path"`
+				OriginalContent string `json:"original_content"`
+				Content         string `json:"content"`
+				CommitMessage   string `json:"commit_message"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
+				return
+			}
+			if req.Owner == "" || req.Repo == "" || req.FilePath == "" {
+				writeError(w, http.StatusBadRequest, "missing_fields", "owner, repo, file_path are required")
+				return
+			}
+			if req.Branch == "" {
+				req.Branch = "main"
+			}
+			if req.CommitMessage == "" {
+				req.CommitMessage = "update: " + req.FilePath
+			}
+			rec := drafts.save(login, req.Owner, req.Repo, req.Branch, req.FilePath, req.OriginalContent, req.Content, req.CommitMessage)
+			writeJSON(w, http.StatusOK, jsonResponse{"draft": rec})
+
+		case http.MethodGet:
+			list := drafts.list(login)
+			writeJSON(w, http.StatusOK, jsonResponse{"drafts": list})
+
+		case http.MethodDelete:
+			q := r.URL.Query()
+			if q.Get("all") == "1" {
+				n := drafts.deleteAll(login)
+				writeJSON(w, http.StatusOK, jsonResponse{"deleted": n})
+				return
+			}
+			id := strings.TrimSpace(q.Get("id"))
+			if id == "" {
+				writeError(w, http.StatusBadRequest, "missing_id", "query param id is required")
+				return
+			}
+			if !drafts.delete(id, login) {
+				writeError(w, http.StatusNotFound, "draft_not_found", "draft not found or not owned by you")
+				return
+			}
+			writeJSON(w, http.StatusOK, jsonResponse{"deleted": id})
+
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		}
+	})
+
+	// ── Draft push to GitHub ──────────────────────────────────────────────────
+	// POST /api/drafts/push  body: { "id": "<draft_id>" }
+	mux.HandleFunc("/api/drafts/push", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeRequest(w, r, cfg.AccessToken) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		ghToken := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if ghToken == "" {
+			writeError(w, http.StatusUnauthorized, "missing_github_token", "X-GitHub-Token header is required")
+			return
+		}
+		login, err := resolveGitHubLogin(r.Context(), ghToken, ghClient)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "github_token_invalid", "failed to resolve GitHub login: "+err.Error())
+			return
+		}
+		var body struct {
+			ID            string `json:"id"`
+			CommitMessage string `json:"commit_message"` // optional override
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json payload")
+			return
+		}
+		rec, ok := drafts.get(body.ID, login)
+		if !ok {
+			writeError(w, http.StatusNotFound, "draft_not_found", "draft not found or not owned by you")
+			return
+		}
+		commitMsg := rec.CommitMessage
+		if strings.TrimSpace(body.CommitMessage) != "" {
+			commitMsg = strings.TrimSpace(body.CommitMessage)
+		}
+		syncReq := gitSyncRequest{
+			Owner: rec.Owner, Repo: rec.Repo, Branch: rec.Branch,
+			FilePath: rec.FilePath, Content: rec.Content, CommitMessage: commitMsg,
+		}
+		task := tasks.create("draft_push", jsonResponse{
+			"draft_id": rec.ID, "repo": rec.Owner + "/" + rec.Repo,
+			"branch": rec.Branch, "path": rec.FilePath,
+		})
+		writeJSON(w, http.StatusAccepted, jsonResponse{"task_id": task.ID, "status": task.Status, "draft_id": rec.ID})
+
+		go func(taskID, draftID, draftLogin string, request gitSyncRequest, token string) {
+			tasks.running(taskID)
+			result, code, err := syncToGitHub(context.Background(), token, request)
+			if err != nil {
+				tasks.fail(taskID, code, err.Error())
+				return
+			}
+			tasks.complete(taskID, result)
+			// Auto-delete the draft after a successful push to avoid re-submission
+			drafts.delete(draftID, draftLogin)
+		}(task.ID, rec.ID, login, syncReq, ghToken)
 	})
 
 	log.Println("routes registered (stateless mode — no disk storage)")
@@ -1075,6 +1442,34 @@ func authorizeRequest(w http.ResponseWriter, r *http.Request, expectedToken stri
 		return false
 	}
 	return true
+}
+
+// resolveGitHubLogin fetches the GitHub login name for the given token.
+func resolveGitHubLogin(ctx context.Context, token string, client *http.Client) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "ZPWU-CODE-agent")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return "", errors.New("invalid or expired GitHub token")
+	}
+	var ud struct {
+		Login string `json:"login"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	_ = json.Unmarshal(raw, &ud)
+	if ud.Login == "" {
+		return "", errors.New("could not resolve GitHub login")
+	}
+	return ud.Login, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, data jsonResponse) {

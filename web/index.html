@@ -77,6 +77,11 @@
           <span class="tab-icon" aria-hidden="true">📁</span>
           <span class="tab-label">文件</span>
         </button>
+        <button class="tab-btn" data-tab="drafts" role="tab" aria-selected="false">
+          <span class="tab-icon" aria-hidden="true">📝</span>
+          <span class="tab-label">草稿箱</span>
+          <span id="draftBadge" class="tab-badge" hidden>0</span>
+        </button>
         <button class="tab-btn" data-tab="providers" role="tab" aria-selected="false">
           <span class="tab-icon" aria-hidden="true">🔑</span>
           <span class="tab-label">API</span>
@@ -188,16 +193,16 @@
               <div class="pane-header">
                 <span id="editorFilePath" class="pane-path" aria-live="polite">未打开文件</span>
                 <div class="pane-actions">
-                  <button id="injectContext" class="action-btn" title="注入AI上下文" aria-label="注入上下文" disabled>→AI</button>
-                  <button id="saveFile" class="action-btn action-btn-primary" title="保存到GitHub" aria-label="保存" disabled>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
-                      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
-                      <polyline points="17 21 17 13 7 13 7 21"></polyline>
-                      <polyline points="7 3 7 8 15 8"></polyline>
-                    </svg>
-                    保存
-                  </button>
-                </div>
+                    <button id="injectContext" class="action-btn" title="注入AI上下文" aria-label="注入上下文" disabled>→AI</button>
+                    <button id="saveDraft" class="action-btn" title="存草稿到服务器" aria-label="存草稿" disabled>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
+                        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                        <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                        <polyline points="7 3 7 8 15 8"></polyline>
+                      </svg>
+                      存草稿
+                    </button>
+                  </div>
               </div>
               <textarea id="fileEditor" class="code-editor"
                         placeholder="打开文件后在此编辑…"
@@ -211,6 +216,23 @@
               </div>
             </div>
 
+          </div>
+        </section>
+
+        <!-- ── 草稿箱 ─────────────────────────────────────── -->
+        <section id="tab-drafts" class="tab-panel" role="tabpanel" hidden>
+          <div class="panel-scroll">
+            <div class="section-header">
+              <h2 class="section-title">草稿箱</h2>
+              <p class="section-desc">文件已暂存到服务器，确认无误后推送到 GitHub，或直接删除。</p>
+            </div>
+            <div class="draft-toolbar">
+              <button id="refreshDrafts" class="btn-secondary">🔄 刷新</button>
+              <button id="clearAllDrafts" class="btn-danger">🗑 清空全部</button>
+            </div>
+            <div id="draftList" class="draft-list" role="list" aria-live="polite">
+              <p class="empty-hint">暂无草稿。在「文件」面板编辑后点「存草稿」。</p>
+            </div>
           </div>
         </section>
 

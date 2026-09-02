@@ -210,9 +210,10 @@ function updateTopBars() {
 /* ══════════════════════════════════════════════════════
    FILE BROWSER
 ══════════════════════════════════════════════════════ */
-let currentOwnerRepo = null;
-let currentDirPath   = '';
-let currentFileCtx   = null; // {path, content}
+let currentOwnerRepo    = null;
+let currentDirPath      = '';
+let currentFileCtx      = null; // {path, content}
+let currentOriginalContent = ''; // raw content from GitHub before editing
 
 async function loadRepoList() {
   const sel=$('repoSelect'); sel.innerHTML='<option>加载中…</option>';
@@ -276,13 +277,17 @@ async function openFile(filePath) {
   if (!currentOwnerRepo) return;
   $('editorFilePath').textContent=filePath;
   $('fileEditor').value='加载中…'; $('fileEditor').disabled=true;
-  $('saveFile').disabled=true; $('injectContext').disabled=true;
+  if ($('saveDraft')) $('saveDraft').disabled=true;
+  $('injectContext').disabled=true;
+  currentOriginalContent='';
   setStatus($('editorStatus'),'','');
   const {owner,repo,branch}=currentOwnerRepo;
   try {
     const d=await ghApi('/api/git/file?'+new URLSearchParams({owner,repo,branch,path:filePath}));
+    currentOriginalContent=d.file.content; // 缓存 GitHub 原始内容
     $('fileEditor').value=d.file.content; $('fileEditor').disabled=false;
-    $('saveFile').disabled=false; $('injectContext').disabled=false;
+    if ($('saveDraft')) $('saveDraft').disabled=false;
+    $('injectContext').disabled=false;
     $('commitMessage').value='fix: update '+d.file.name;
     setStatus($('editorStatus'),`${d.file.size} 字节 · SHA ${d.file.sha.slice(0,7)}`,'ok');
   } catch(e) { $('fileEditor').value=''; $('fileEditor').disabled=false; setStatus($('editorStatus'),'加载失败: '+e.message,'err'); }
@@ -290,24 +295,28 @@ async function openFile(filePath) {
 
 $('refreshFiles').addEventListener('click',()=>loadDir(currentDirPath));
 
-$('saveFile').addEventListener('click',async()=>{
+// ── 存草稿（服务器暂存，不直接 push GitHub）────────────────
+$('saveDraft').addEventListener('click',async()=>{
   if (!currentOwnerRepo) return;
   const fp=$('editorFilePath').textContent.trim(); if (!fp||fp==='未打开文件') return;
   const ght=getGHToken(); if (!ght) { setStatus($('editorStatus'),'请先登录 GitHub','err'); return; }
   const {owner,repo,branch}=currentOwnerRepo;
-  $('saveFile').disabled=true; setStatus($('editorStatus'),'提交中…','');
+  $('saveDraft').disabled=true; setStatus($('editorStatus'),'存草稿中…','');
   try {
-    const task=await api('/api/git/sync',{
+    await ghApi('/api/drafts',{
       method:'POST',
-      headers:{'Content-Type':'application/json','X-GitHub-Token':ght},
-      body:JSON.stringify({owner,repo,branch,file_path:fp,content:$('fileEditor').value,commit_message:$('commitMessage').value.trim()||'update: '+fp})
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        owner,repo,branch,file_path:fp,
+        original_content:currentOriginalContent, // GitHub 原始内容
+        content:$('fileEditor').value,
+        commit_message:$('commitMessage').value.trim()||'update: '+fp
+      })
     });
-    const r=await pollTask(task.task_id,t=>setStatus($('editorStatus'),t.status+'…',''));
-    r.status==='completed'
-      ? setStatus($('editorStatus'),`✓ commit ${r.result?.commit_sha?.slice(0,7)||''}`,'ok')
-      : setStatus($('editorStatus'),'失败: '+(r.error?.message||''),'err');
-  } catch(e) { setStatus($('editorStatus'),'失败: '+e.message,'err'); }
-  finally { $('saveFile').disabled=false; }
+    setStatus($('editorStatus'),'✓ 已存为草稿，在「草稿箱」查看 diff 后推送','ok');
+    loadDraftCount();
+  } catch(e) { setStatus($('editorStatus'),'存草稿失败: '+e.message,'err'); }
+  finally { $('saveDraft').disabled=false; }
 });
 
 $('injectContext').addEventListener('click',()=>{
@@ -317,6 +326,212 @@ $('injectContext').addEventListener('click',()=>{
   switchTab('chat');
 });
 $('clearContext').addEventListener('click',()=>{ currentFileCtx=null; $('contextBar').hidden=true; $('contextFileName').textContent=''; });
+
+/* ══════════════════════════════════════════════════════
+   DRAFTS — 草稿箱
+══════════════════════════════════════════════════════ */
+// ── Inline diff 引擎（LCS，带大文件保护）────────────────
+const DIFF_LINE_LIMIT = 500; // 超过此行数改用简化模式，避免 O(m×n) OOM
+
+function computeDiff(oldText, newText) {
+  const oldLines = oldText.split('\n');
+  const newLines = newText.split('\n');
+  const m = oldLines.length, n = newLines.length;
+
+  // 大文件保护：超过阈值时只比较头尾各 80 行
+  if (m > DIFF_LINE_LIMIT || n > DIFF_LINE_LIMIT) {
+    const HEAD = 80, TAIL = 80;
+    // 确保 head 和 tail 不重叠
+    const headEndOld = Math.min(HEAD, m), headEndNew = Math.min(HEAD, n);
+    const tailStartOld = Math.max(headEndOld, m - TAIL);
+    const tailStartNew = Math.max(headEndNew, n - TAIL);
+
+    const ops = [];
+    ops.push(...lcs(oldLines.slice(0, headEndOld), newLines.slice(0, headEndNew)));
+
+    // 只有当尾部不与头部重叠时才插入省略行
+    if (tailStartOld > headEndOld || tailStartNew > headEndNew) {
+      ops.push({t:'ctx', v:`… 文件过大，中间部分已省略 …`});
+      ops.push(...lcs(oldLines.slice(tailStartOld), newLines.slice(tailStartNew)));
+    }
+    return ops;
+  }
+
+  return lcs(oldLines, newLines);
+}
+
+function lcs(oldLines, newLines) {
+  const m = oldLines.length, n = newLines.length;
+  const dp = Array.from({length:m+1},()=>new Int32Array(n+1));
+  for (let i=1;i<=m;i++) for (let j=1;j<=n;j++) {
+    dp[i][j] = oldLines[i-1]===newLines[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j],dp[i][j-1]);
+  }
+  const ops=[];
+  let i=m, j=n;
+  while (i>0||j>0) {
+    if (i>0&&j>0&&oldLines[i-1]===newLines[j-1]) { ops.push({t:'=',v:oldLines[i-1]}); i--;j--; }
+    else if (j>0&&(i===0||dp[i][j-1]>=dp[i-1][j])) { ops.push({t:'+',v:newLines[j-1]}); j--; }
+    else { ops.push({t:'-',v:oldLines[i-1]}); i--; }
+  }
+  return ops.reverse();
+}
+
+function renderDiffHTML(ops) {
+  const CTX=3;
+  let html='', changed=ops.map(o=>o.t!=='='&&o.t!=='ctx');
+  for (let i=0;i<ops.length;i++) {
+    const o=ops[i];
+    if (o.t==='ctx') { html+=`<div class="diff-ctx">${esc(o.v)}</div>`; continue; }
+    const near=changed.slice(Math.max(0,i-CTX),i+CTX+1).some(Boolean);
+    if (!near) {
+      if (i===0||ops[i-1].t==='=') html+=`<div class="diff-ctx">…</div>`;
+      continue;
+    }
+    const cls=o.t==='+'?'diff-add':o.t==='-'?'diff-del':'diff-eq';
+    const prefix=o.t==='+'?'+ ':o.t==='-'?'- ':'  ';
+    html+=`<div class="${cls}">${esc(prefix+o.v)}</div>`;
+  }
+  return html||'<div class="diff-eq">（无变化）</div>';
+}
+
+async function loadDraftList() {
+  const el=$('draftList'); if (!el) return;
+  el.innerHTML='<p class="empty-hint">加载中…</p>';
+  try {
+    const d=await ghApi('/api/drafts');
+    renderDraftList(d.drafts||[]);
+    updateDraftBadge(d.drafts?.length||0);
+  } catch(e) {
+    el.innerHTML=`<p class="empty-hint tree-err">加载失败: ${esc(e.message)}</p>`;
+  }
+}
+
+async function loadDraftCount() {
+  try {
+    const d=await ghApi('/api/drafts');
+    updateDraftBadge(d.drafts?.length||0);
+  } catch(_) {}
+}
+
+function updateDraftBadge(n) {
+  const badge=$('draftBadge'); if (!badge) return;
+  if (n>0) { badge.textContent=n; badge.hidden=false; }
+  else { badge.hidden=true; }
+}
+
+function renderDraftList(drafts) {
+  const el=$('draftList'); if (!el) return;
+  if (!drafts.length) { el.innerHTML='<p class="empty-hint">暂无草稿。在「文件」面板编辑后点「存草稿」。</p>'; return; }
+  el.innerHTML='';
+  drafts.forEach(d=>{
+    const card=document.createElement('div');
+    card.className='draft-card'; card.setAttribute('role','listitem');
+    const ts=new Date(d.updated_at||d.created_at).toLocaleString('zh-CN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+
+    // 计算 diff
+    const origText = d.original_content||'';
+    const newText  = d.content||'';
+    const ops = computeDiff(origText, newText);
+    const addCount = ops.filter(o=>o.t==='+').length;
+    const delCount = ops.filter(o=>o.t==='-').length;
+    const diffHTML = renderDiffHTML(ops);
+    const hasDiff  = addCount>0||delCount>0;
+
+    card.innerHTML=`
+      <div class="draft-card-header">
+        <span class="draft-repo">${esc(d.owner)}/${esc(d.repo)}</span>
+        <span class="draft-branch">@${esc(d.branch)}</span>
+        <span class="draft-ts">${ts}</span>
+      </div>
+      <div class="draft-path">${esc(d.file_path)}</div>
+      ${hasDiff
+        ? `<div class="diff-stat"><span class="diff-stat-add">+${addCount}</span> <span class="diff-stat-del">-${delCount}</span> 行变更</div>`
+        : `<div class="diff-stat diff-stat-none">无变更</div>`
+      }
+      <details class="draft-diff-wrap" open>
+        <summary class="draft-preview-toggle">查看 Diff</summary>
+        <div class="diff-view">${diffHTML}</div>
+      </details>
+      <div class="draft-commit-row">
+        <label class="commit-label" style="white-space:nowrap">提交信息</label>
+        <input class="draft-commit-input commit-input" value="${esc(d.commit_message)}" placeholder="提交信息" aria-label="提交信息" data-did="${esc(d.id)}" />
+      </div>
+      <div class="draft-actions">
+        <button class="btn-primary draft-push" data-did="${esc(d.id)}" ${!hasDiff?'disabled':''}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+          ✔ 授权推送 GitHub
+        </button>
+        <button class="btn-ghost draft-reject" data-did="${esc(d.id)}">✕ 拒绝此草稿</button>
+      </div>
+      <div class="draft-status" id="dst-${esc(d.id)}" role="status" aria-live="polite"></div>`;
+    el.appendChild(card);
+  });
+
+  // ── 授权推送（必须用户主动点击确认）────────────────────
+  el.querySelectorAll('.draft-push').forEach(btn=>btn.addEventListener('click',async()=>{
+    const did=btn.dataset.did;
+    const card=btn.closest('.draft-card');
+    const msgInput=card.querySelector('.draft-commit-input');
+    const fp=card.querySelector('.draft-path')?.textContent||'';
+    const repoLabel=card.querySelector('.draft-repo')?.textContent||'';
+    const branchLabel=card.querySelector('.draft-branch')?.textContent||'';
+    const statusEl=$('dst-'+did);
+    const commitMsg=msgInput?.value.trim()||'';
+
+    // ── 用户授权确认 ──
+    const ok=confirm(
+      `⚠️ 授权推送到 GitHub\n\n` +
+      `仓库：${repoLabel} ${branchLabel}\n` +
+      `文件：${fp}\n` +
+      `提交：${commitMsg||'（空）'}\n\n` +
+      `确认将把此草稿的变更提交到远程仓库。`
+    );
+    if (!ok) return;
+
+    btn.disabled=true; setStatus(statusEl,'推送中…','');
+    try {
+      const task=await ghApi('/api/drafts/push',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({id:did,commit_message:commitMsg})
+      });
+      const r=await pollTask(task.task_id,t=>setStatus(statusEl,t.status+'…',''));
+      if (r.status==='completed') {
+        setStatus(statusEl,`✓ commit ${r.result?.commit_sha?.slice(0,7)||''}  已推送`,'ok');
+        setTimeout(()=>loadDraftList(),1200);
+      } else {
+        setStatus(statusEl,'失败: '+(r.error?.message||''),'err');
+        btn.disabled=false;
+      }
+    } catch(e) { setStatus(statusEl,'失败: '+e.message,'err'); btn.disabled=false; }
+  }));
+
+  // ── 拒绝草稿（删除）────────────────────────────────────
+  el.querySelectorAll('.draft-reject').forEach(btn=>btn.addEventListener('click',async()=>{
+    const did=btn.dataset.did;
+    const statusEl=$('dst-'+did);
+    if (!confirm('拒绝并删除此草稿？')) return;
+    btn.disabled=true; setStatus(statusEl,'删除中…','');
+    try {
+      await ghApi('/api/drafts?id='+encodeURIComponent(did),{method:'DELETE'});
+      await loadDraftList();
+    } catch(e) { setStatus(statusEl,'删除失败: '+e.message,'err'); btn.disabled=false; }
+  }));
+}
+
+$('refreshDrafts')?.addEventListener('click',()=>loadDraftList());
+$('clearAllDrafts')?.addEventListener('click',async()=>{
+  if (!confirm('确认清空所有草稿？此操作不可恢复。')) return;
+  try {
+    const d=await ghApi('/api/drafts?all=1',{method:'DELETE'});
+    await loadDraftList();
+  } catch(e) { alert('清空失败: '+e.message); }
+});
+
+// Tab 切换到草稿箱时自动刷新
+document.querySelectorAll('.tab-btn').forEach(b=>b.addEventListener('click',()=>{
+  if (b.dataset.tab==='drafts') loadDraftList();
+}));
 
 /* ══════════════════════════════════════════════════════
    CHAT — 普通对话 + Agent Loop（SSE）
@@ -356,6 +571,75 @@ function appendToolCard(name, input) {
     <pre class="tool-input">${esc(input)}</pre>
     <div class="tool-result-area"></div>`;
   chatMsgs.appendChild(d); chatMsgs.scrollTop=chatMsgs.scrollHeight; return d;
+}
+
+// ── 授权卡片（write_file 调用前展示给用户）─────────────────
+function appendApprovalCard(callId, filePath, content, commitMsg) {
+  const d=document.createElement('div'); d.className='agent-event agent-approval';
+  // 计算预览（前 400 字符）
+  const preview=content.slice(0,400)+(content.length>400?'\n…（已截断）':'');
+  d.innerHTML=`
+    <div class="approval-header">
+      <span class="approval-icon">✍️</span>
+      <span class="approval-title">AI 请求写入文件</span>
+      <span class="approval-badge pending">等待授权</span>
+    </div>
+    <div class="approval-path">${esc(filePath)}</div>
+    <div class="approval-commit">提交：${esc(commitMsg||'（无提交信息）')}</div>
+    <details class="approval-preview-wrap">
+      <summary class="draft-preview-toggle">预览内容</summary>
+      <pre class="draft-content">${esc(preview)}</pre>
+    </details>
+    <div class="approval-actions">
+      <button class="btn-primary approval-allow" data-cid="${esc(callId)}">
+        ✔ 允许写入
+      </button>
+      <button class="btn-danger approval-deny" data-cid="${esc(callId)}">
+        ✕ 拒绝
+      </button>
+    </div>
+    <div class="approval-status" id="aps-${esc(callId)}" role="status" aria-live="polite"></div>`;
+  chatMsgs.appendChild(d); chatMsgs.scrollTop=chatMsgs.scrollHeight;
+
+  // ── 允许 ──
+  d.querySelector('.approval-allow').addEventListener('click', async()=>{
+    const btn=d.querySelector('.approval-allow');
+    btn.disabled=true; d.querySelector('.approval-deny').disabled=true;
+    try {
+      await api('/api/agent/approve',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({call_id:callId,approved:true})
+      });
+      const badge=d.querySelector('.approval-badge');
+      if (badge) { badge.textContent='✓ 已授权'; badge.className='approval-badge approved'; }
+      d.querySelector('.approval-actions').hidden=true;
+    } catch(e) {
+      const s=d.querySelector('.approval-status'); if(s) s.textContent='失败: '+e.message;
+      btn.disabled=false; d.querySelector('.approval-deny').disabled=false;
+    }
+  });
+
+  // ── 拒绝 ──
+  d.querySelector('.approval-deny').addEventListener('click', async()=>{
+    const btn=d.querySelector('.approval-deny');
+    btn.disabled=true; d.querySelector('.approval-allow').disabled=true;
+    try {
+      await api('/api/agent/approve',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({call_id:callId,approved:false,reason:'用户拒绝'})
+      });
+      const badge=d.querySelector('.approval-badge');
+      if (badge) { badge.textContent='✗ 已拒绝'; badge.className='approval-badge rejected'; }
+      d.querySelector('.approval-actions').hidden=true;
+    } catch(e) {
+      const s=d.querySelector('.approval-status'); if(s) s.textContent='失败: '+e.message;
+      btn.disabled=false; d.querySelector('.approval-allow').disabled=false;
+    }
+  });
+
+  return d;
 }
 
 function updateToolCard(card, resultText, ok) {
@@ -486,19 +770,54 @@ async function runAgentMode(msg, pv) {
             break;
 
           case 'tool_call': {
-            // #fix1: key by call_id, not tool+'_'+round
             const card=appendToolCard(ev.tool, ev.input||'');
             toolCards.set(ev.call_id||ev.tool+'_'+ev.round, card);
-            // #fix3: record for history
             pendingToolCalls.push({call_id:ev.call_id, tool_name:ev.tool, args:ev.input||''});
             break;
           }
 
+          case 'tool_approval': {
+            // Agent wants to write_file — render authorisation card
+            const approvalCard=appendApprovalCard(ev.call_id, ev.file_path||'', ev.content||'', ev.commit_message||'');
+            toolCards.set(ev.call_id, approvalCard);
+            // Record in pendingToolCalls so history is complete regardless of decision.
+            // args must be the original JSON arguments string (path/content/commit_message),
+            // NOT the raw file content — that would pollute the AI context window.
+            const approvalArgs=JSON.stringify({
+              path: ev.file_path||'',
+              content: ev.content||'',
+              commit_message: ev.commit_message||''
+            });
+            pendingToolCalls.push({call_id:ev.call_id, tool_name:'write_file', args:approvalArgs});
+            break;
+          }
+
+          case 'tool_approved': {
+            const card=toolCards.get(ev.call_id);
+            if (card) {
+              const badge=card.querySelector('.approval-badge');
+              if (badge) { badge.textContent='✓ 已授权执行'; badge.className='approval-badge approved'; }
+              const actions=card.querySelector('.approval-actions');
+              if (actions) actions.hidden=true;
+            }
+            break;
+          }
+
+          case 'tool_rejected': {
+            const card=toolCards.get(ev.call_id);
+            if (card) {
+              const badge=card.querySelector('.approval-badge');
+              if (badge) { badge.textContent='✗ 已拒绝'; badge.className='approval-badge rejected'; }
+              const actions=card.querySelector('.approval-actions');
+              if (actions) actions.hidden=true;
+            }
+            if (ev.call_id) toolResults.set(ev.call_id, ev.content||'已拒绝');
+            break;
+          }
+
           case 'tool_result': {
-            // #fix1: lookup by call_id
             const card=toolCards.get(ev.call_id||ev.tool+'_'+ev.round);
             if (card) updateToolCard(card, ev.content, !ev.content?.startsWith('Tool execution error'));
-            // #fix3: record result
             if (ev.call_id) toolResults.set(ev.call_id, ev.content||'');
             break;
           }
@@ -569,6 +888,7 @@ function initApp() {
   renderPVList();
   loadRepoList();
   $('appToken').value = loadCfg().appToken||'';
+  loadDraftCount();
 }
 
 if ('serviceWorker' in navigator) {

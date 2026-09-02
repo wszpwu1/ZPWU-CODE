@@ -21,12 +21,15 @@ import (
 type EventType string
 
 const (
-	EventThinking   EventType = "thinking"    // AI is reasoning / generating
-	EventToolCall   EventType = "tool_call"   // AI requested a tool
-	EventToolResult EventType = "tool_result" // tool executed, result ready
-	EventText       EventType = "text"        // final AI text
-	EventDone       EventType = "done"        // agent loop finished
-	EventError      EventType = "error"       // fatal error
+	EventThinking   EventType = "thinking"      // AI is reasoning / generating
+	EventToolCall   EventType = "tool_call"     // AI requested a tool
+	EventToolResult EventType = "tool_result"   // tool executed, result ready
+	EventText       EventType = "text"          // final AI text
+	EventDone       EventType = "done"          // agent loop finished
+	EventError      EventType = "error"         // fatal error
+	EventApproval   EventType = "tool_approval" // waiting for user to approve tool execution
+	EventApproved   EventType = "tool_approved" // user approved, executing
+	EventRejected   EventType = "tool_rejected" // user rejected
 )
 
 // Event is serialised to SSE data lines.
@@ -37,11 +40,38 @@ type Event struct {
 	CallID  string    `json:"call_id,omitempty"` // unique tool call id (fix #1)
 	Input   string    `json:"input,omitempty"`   // tool arguments (JSON string)
 	Round   int       `json:"round,omitempty"`   // loop iteration
+	// Approval fields
+	FilePath      string `json:"file_path,omitempty"`
+	CommitMessage string `json:"commit_message,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
 }
 
 // Emitter sends SSE events.
 type Emitter interface {
 	Emit(e Event)
+}
+
+// ─── Approver interface ───────────────────────────────────────────────────────
+
+// ApprovalDecision is the user's answer to a tool-approval request.
+type ApprovalDecision struct {
+	Approved bool
+	Reason   string // optional rejection reason
+}
+
+// Approver gates write_file execution behind user confirmation.
+// Implementations block until the user responds (or ctx is cancelled).
+type Approver interface {
+	// RequestApproval sends an approval event via SSE and blocks until the
+	// user responds or ctx is done. Returns true if user approved.
+	RequestApproval(ctx context.Context, callID, filePath, content, commitMsg string) (bool, error)
+}
+
+// NoopApprover always approves immediately (used when no approver is wired in).
+type NoopApprover struct{}
+
+func (NoopApprover) RequestApproval(_ context.Context, _, _, _, _ string) (bool, error) {
+	return true, nil
 }
 
 // ─── Agent run request ────────────────────────────────────────────────────────
@@ -57,7 +87,8 @@ type RunRequest struct {
 	History      []Message
 	UserMessage  string
 	Repo         RepoCtx
-	MaxRounds    int // default 10
+	MaxRounds    int      // default 10
+	Approver     Approver // gates write_file; nil → NoopApprover
 }
 
 // Message is a conversation turn.
@@ -99,6 +130,10 @@ func NormalizeOpenAIEndpoint(base string) (string, error) {
 func Run(ctx context.Context, req RunRequest, emitter Emitter) ([]Message, error) {
 	if req.MaxRounds <= 0 {
 		req.MaxRounds = 10
+	}
+	approver := req.Approver
+	if approver == nil {
+		approver = NoopApprover{}
 	}
 	executor := NewExecutor(req.Repo)
 	client := &http.Client{Timeout: 90 * time.Second}
@@ -148,14 +183,44 @@ func Run(ctx context.Context, req RunRequest, emitter Emitter) ([]Message, error
 			if len(argsDisplay) > 300 {
 				argsDisplay = argsDisplay[:300] + "…"
 			}
-			// #fix1: emit CallID so frontend can key cards by unique id
-			emitter.Emit(Event{
-				Type:   EventToolCall,
-				Tool:   tc.Function.Name,
-				CallID: tc.ID,
-				Input:  argsDisplay,
-				Round:  round,
-			})
+
+			// ── write_file: gate behind user approval (approver emits the SSE event) ──
+			if tc.Function.Name == "write_file" {
+				var args map[string]string
+				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+				// NOTE: do NOT emit EventApproval here — sseApprover.RequestApproval
+				// already emits it. Emitting twice would render two cards in the UI.
+				approved, approveErr := approver.RequestApproval(
+					ctx, tc.ID,
+					args["path"], args["content"], args["commit_message"],
+				)
+				if approveErr != nil {
+					emitter.Emit(Event{Type: EventError, Content: "授权等待超时或连接断开"})
+					return history, approveErr
+				}
+				if !approved {
+					result := fmt.Sprintf("用户拒绝了对 '%s' 的写入操作。", args["path"])
+					emitter.Emit(Event{
+						Type: EventRejected, Tool: tc.Function.Name,
+						CallID: tc.ID, Content: result, Round: round,
+					})
+					history = append(history, Message{Role: "tool", Content: result, ToolCallID: tc.ID})
+					continue
+				}
+				emitter.Emit(Event{
+					Type: EventApproved, Tool: tc.Function.Name,
+					CallID: tc.ID, Content: "用户已授权，正在写入…", Round: round,
+				})
+			} else {
+				// Non-write tools: emit tool_call event as before
+				emitter.Emit(Event{
+					Type:   EventToolCall,
+					Tool:   tc.Function.Name,
+					CallID: tc.ID,
+					Input:  argsDisplay,
+					Round:  round,
+				})
+			}
 
 			result, execErr := executor.Execute(ctx, tc)
 			if execErr != nil {

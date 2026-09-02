@@ -48,6 +48,7 @@
 
 /* ── Reset ───────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 html, body {
   margin: 0; height: 100%; overflow: hidden;
@@ -630,6 +631,151 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .visually-hidden {
   position: absolute; width: 1px; height: 1px; padding: 0;
   margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
+
+/* ── Tab Badge ─────────────────────────────────────────────── */
+.tab-badge {
+  min-width: 16px; height: 16px; border-radius: 20px;
+  background: var(--red); color: #fff;
+  font-size: 0.6rem; font-weight: 700; line-height: 16px;
+  padding: 0 4px; text-align: center;
+  position: absolute; top: 4px; right: 4px;
+}
+
+/* ── 草稿箱工具栏 ───────────────────────────────────────────── */
+.draft-toolbar {
+  display: flex; gap: 8px; margin-bottom: 12px;
+}
+
+/* ── 草稿卡片 ───────────────────────────────────────────────── */
+.draft-list { display: flex; flex-direction: column; gap: 12px; }
+
+.draft-card {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-lg);
+  padding: 14px; overflow: hidden;
+  border-left: 3px solid var(--yellow);
+  animation: bubbleIn 0.2s ease;
+}
+
+.draft-card-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap;
+}
+.draft-repo   { font-weight: 600; font-size: 0.88rem; color: var(--c-text); }
+.draft-branch { font-size: 0.75rem; color: var(--cyan); font-family: monospace; }
+.draft-ts     { margin-left: auto; font-size: 0.7rem; color: var(--c-text3); }
+
+.draft-path {
+  font-family: 'Menlo','Consolas','Courier New',monospace;
+  font-size: 0.78rem; color: var(--blue); margin-bottom: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.draft-commit {
+  font-size: 0.76rem; color: var(--c-text2); margin-bottom: 10px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 内容预览 */
+.draft-preview { margin-bottom: 10px; }
+.draft-preview-toggle {
+  font-size: 0.76rem; color: var(--c-text2); cursor: pointer; user-select: none;
+  padding: 4px 0; list-style: none;
+}
+.draft-preview-toggle::-webkit-details-marker { display: none; }
+.draft-preview-toggle::before { content: '▶ '; }
+details[open] .draft-preview-toggle::before { content: '▼ '; }
+.draft-content {
+  margin: 8px 0 0; padding: 10px;
+  background: rgba(0,0,0,0.3); border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  font-family: 'Menlo','Consolas','Courier New',monospace;
+  font-size: 0.73rem; color: var(--c-text2);
+  white-space: pre-wrap; word-break: break-all;
+  max-height: 200px; overflow-y: auto;
+}
+
+/* 提交信息编辑行 */
+.draft-commit-row { margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+.draft-commit-input {
+  width: 100%; background: var(--c-surface); border: 1px solid var(--c-border2);
+  border-radius: 6px; color: var(--c-text); padding: 6px 10px;
+  font-size: 0.8rem; font-family: inherit; outline: none;
+}
+.draft-commit-input:focus { border-color: var(--blue); }
+
+.draft-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.draft-actions button { font-size: 0.78rem; padding: 6px 14px; }
+
+/* diff 统计 */
+.diff-stat {
+  font-size: 0.75rem; margin-bottom: 8px; display: flex; gap: 8px; align-items: center;
+}
+.diff-stat-add { color: #4ade80; font-weight: 600; }
+.diff-stat-del { color: #f87171; font-weight: 600; }
+.diff-stat-none { color: var(--c-text3); }
+
+/* diff 容器 */
+.draft-diff-wrap { margin-bottom: 10px; }
+.diff-view {
+  margin-top: 8px;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  font-family: 'Menlo','Consolas','Courier New',monospace;
+  font-size: 0.72rem; line-height: 1.55;
+  overflow-x: auto; overflow-y: auto;
+  max-height: 320px;
+}
+.diff-view div { padding: 1px 10px; white-space: pre; }
+.diff-add  { background: rgba(74,222,128,0.12); color: #4ade80; }
+.diff-del  { background: rgba(248,113,113,0.12); color: #f87171; text-decoration: line-through; }
+.diff-eq   { color: var(--c-text2); }
+.diff-ctx  { color: var(--c-text3); padding: 2px 10px; font-style: italic; font-size: 0.68rem; }
+
+.draft-status {
+  font-size: 0.75rem; color: var(--c-text2); min-height: 18px; margin-top: 6px;
+  display: flex; align-items: center; gap: 6px;
+}
+.draft-status.ok  { color: var(--green); }
+.draft-status.err { color: var(--red); }
+
+/* ── Agent 授权卡片 ──────────────────────────────────────── */
+.agent-approval {
+  border-left-color: var(--purple);
+  padding: 0; overflow: hidden;
+  animation: bubbleIn 0.2s ease;
+}
+.approval-header {
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  background: rgba(139,92,246,0.1);
+}
+.approval-icon { font-size: 1rem; }
+.approval-title { font-weight: 600; color: var(--purple); flex: 1; font-size: 0.84rem; }
+.approval-badge {
+  font-size: 0.7rem; padding: 2px 9px; border-radius: 20px; font-weight: 600;
+}
+.approval-badge.pending  { background: rgba(245,158,11,0.2); color: var(--yellow); }
+.approval-badge.approved { background: rgba(16,185,129,0.15); color: var(--green); }
+.approval-badge.rejected { background: rgba(239,68,68,0.15); color: var(--red); }
+
+.approval-path {
+  font-family: 'Menlo','Consolas','Courier New',monospace;
+  font-size: 0.78rem; color: var(--blue); padding: 6px 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  border-top: 1px solid rgba(255,255,255,0.04);
+}
+.approval-commit {
+  font-size: 0.76rem; color: var(--c-text2); padding: 4px 12px 8px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.approval-preview-wrap { margin: 0 12px 10px; }
+.approval-actions {
+  display: flex; gap: 8px; padding: 0 12px 12px; flex-wrap: wrap;
+}
+.approval-actions button { font-size: 0.78rem; padding: 7px 16px; }
+.approval-status {
+  font-size: 0.73rem; color: var(--red); padding: 0 12px 8px; min-height: 16px;
 }
 
 /* ── 桌面（≥ 680px）────────────────────────────────────────── */
