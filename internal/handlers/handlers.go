@@ -503,25 +503,37 @@ func normalizeChatEndpoint(base string) (string, error) {
 // handler sends the decision.
 type approvalStore struct {
 	mu    sync.Mutex
-	chans map[string]chan agent.ApprovalDecision
+	chans map[string]approvalEntry
+}
+
+type approvalEntry struct {
+	ch        chan agent.ApprovalDecision
+	ownerLogin string
 }
 
 func newApprovalStore() *approvalStore {
-	return &approvalStore{chans: make(map[string]chan agent.ApprovalDecision)}
+	return &approvalStore{chans: make(map[string]approvalEntry)}
 }
 
-// wait registers a channel for callID and blocks until a decision arrives
-// or ctx is done. Returns true if approved.
-func (a *approvalStore) wait(ctx context.Context, callID string) (bool, error) {
+func (a *approvalStore) begin(callID, ownerLogin string) (chan agent.ApprovalDecision, error) {
 	ch := make(chan agent.ApprovalDecision, 1)
 	a.mu.Lock()
-	a.chans[callID] = ch
+	defer a.mu.Unlock()
+	if _, exists := a.chans[callID]; exists {
+		return nil, errors.New("approval already pending for this call_id")
+	}
+	a.chans[callID] = approvalEntry{ch: ch, ownerLogin: ownerLogin}
+	return ch, nil
+}
+
+func (a *approvalStore) end(callID string) {
+	a.mu.Lock()
+	delete(a.chans, callID)
 	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.chans, callID)
-		a.mu.Unlock()
-	}()
+}
+
+// wait blocks until a decision arrives or ctx is done. Returns true if approved.
+func (a *approvalStore) wait(ctx context.Context, ch <-chan agent.ApprovalDecision) (bool, error) {
 	select {
 	case d := <-ch:
 		return d.Approved, nil
@@ -531,22 +543,30 @@ func (a *approvalStore) wait(ctx context.Context, callID string) (bool, error) {
 }
 
 // decide sends the user's decision for callID.
-func (a *approvalStore) decide(callID string, d agent.ApprovalDecision) bool {
+func (a *approvalStore) decide(callID, login string, d agent.ApprovalDecision) error {
 	a.mu.Lock()
-	ch, ok := a.chans[callID]
+	entry, ok := a.chans[callID]
 	a.mu.Unlock()
 	if !ok {
-		return false
+		return errors.New("approval not found")
 	}
-	ch <- d
-	return true
+	if entry.ownerLogin != "" && entry.ownerLogin != login {
+		return errors.New("approval does not belong to this user")
+	}
+	select {
+	case entry.ch <- d:
+		return nil
+	default:
+		return errors.New("approval already decided")
+	}
 }
 
 // ─── SSEApprover — wires approvalStore + SSE emitter into agent.Approver ──────
 
 type sseApprover struct {
-	emitter agent.Emitter
-	store   *approvalStore
+	emitter    agent.Emitter
+	store      *approvalStore
+	ownerLogin string
 }
 
 func (s *sseApprover) RequestApproval(ctx context.Context, callID, filePath, content, commitMsg string) (bool, error) {
@@ -558,6 +578,11 @@ func (s *sseApprover) RequestApproval(ctx context.Context, callID, filePath, con
 	if len(previewContent) > maxPreview {
 		previewContent = previewContent[:maxPreview] + "\n\n… (内容过长，已截断预览)"
 	}
+	ch, err := s.store.begin(callID, s.ownerLogin)
+	if err != nil {
+		return false, err
+	}
+	defer s.store.end(callID)
 	// Emit the approval-request event; frontend will show an authorisation card.
 	s.emitter.Emit(agent.Event{
 		Type:          agent.EventApproval,
@@ -568,7 +593,7 @@ func (s *sseApprover) RequestApproval(ctx context.Context, callID, filePath, con
 		Content:       previewContent,
 	})
 	// Block until the user responds via POST /api/agent/approve
-	return s.store.wait(ctx, callID)
+	return s.store.wait(ctx, ch)
 }
 
 // ─── Draft Store (in-memory, per GitHub-login) ───────────────────────────────
@@ -1245,6 +1270,11 @@ window.location.replace('/');
 			writeError(w, http.StatusBadRequest, "missing_repo", "owner and repo are required")
 			return
 		}
+		login, err := resolveGitHubLogin(r.Context(), ghToken, ghClient)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "github_token_invalid", "failed to resolve GitHub login: "+err.Error())
+			return
+		}
 		emitter, ok := agent.NewSSEEmitter(w)
 		if !ok {
 			writeError(w, http.StatusInternalServerError, "sse_not_supported", "SSE not supported by this transport")
@@ -1252,7 +1282,7 @@ window.location.replace('/');
 		}
 		runReq := req.BuildRunRequest(ghToken)
 		// Wire up user-approval gate for write_file tool calls
-		runReq.Approver = &sseApprover{emitter: emitter, store: approvals}
+		runReq.Approver = &sseApprover{emitter: emitter, store: approvals, ownerLogin: login}
 		_, _ = agent.Run(r.Context(), runReq, emitter)
 	})
 
@@ -1264,6 +1294,16 @@ window.location.replace('/');
 		}
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		ghToken := strings.TrimSpace(r.Header.Get("X-GitHub-Token"))
+		if ghToken == "" {
+			writeError(w, http.StatusUnauthorized, "missing_github_token", "X-GitHub-Token header is required")
+			return
+		}
+		login, err := resolveGitHubLogin(r.Context(), ghToken, ghClient)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "github_token_invalid", "failed to resolve GitHub login: "+err.Error())
 			return
 		}
 		var body struct {
@@ -1279,12 +1319,21 @@ window.location.replace('/');
 			writeError(w, http.StatusBadRequest, "missing_call_id", "call_id is required")
 			return
 		}
-		ok2 := approvals.decide(body.CallID, agent.ApprovalDecision{
+		err = approvals.decide(body.CallID, login, agent.ApprovalDecision{
 			Approved: body.Approved,
 			Reason:   body.Reason,
 		})
-		if !ok2 {
-			writeError(w, http.StatusNotFound, "approval_not_found", "no pending approval for this call_id")
+		if err != nil {
+			switch err.Error() {
+			case "approval not found":
+				writeError(w, http.StatusNotFound, "approval_not_found", "no pending approval for this call_id")
+			case "approval does not belong to this user":
+				writeError(w, http.StatusForbidden, "approval_forbidden", "you cannot approve another user's pending write")
+			case "approval already decided":
+				writeError(w, http.StatusConflict, "approval_already_decided", "approval already submitted for this call_id")
+			default:
+				writeError(w, http.StatusInternalServerError, "approval_failed", err.Error())
+			}
 			return
 		}
 		writeJSON(w, http.StatusOK, jsonResponse{"accepted": true, "approved": body.Approved})

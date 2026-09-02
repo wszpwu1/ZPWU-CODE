@@ -606,7 +606,7 @@ function appendApprovalCard(callId, filePath, content, commitMsg) {
     const btn=d.querySelector('.approval-allow');
     btn.disabled=true; d.querySelector('.approval-deny').disabled=true;
     try {
-      await api('/api/agent/approve',{
+      await ghApi('/api/agent/approve',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({call_id:callId,approved:true})
@@ -625,7 +625,7 @@ function appendApprovalCard(callId, filePath, content, commitMsg) {
     const btn=d.querySelector('.approval-deny');
     btn.disabled=true; d.querySelector('.approval-allow').disabled=true;
     try {
-      await api('/api/agent/approve',{
+      await ghApi('/api/agent/approve',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({call_id:callId,approved:false,reason:'用户拒绝'})
