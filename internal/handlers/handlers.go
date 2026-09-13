@@ -822,12 +822,20 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 			return
 		}
+		// Report the *actual* persistence posture instead of a hard-coded
+		// "stateless" string, so operators can confirm DRAFTS_FILE and
+		// SSRF_STRICT took effect after a redeploy.
+		storage := "github-only (drafts: memory)"
+		if cfg.DraftsFile != "" {
+			storage = "github-only (drafts: " + cfg.DraftsFile + ")"
+		}
 		writeJSON(w, http.StatusOK, jsonResponse{
 			"status": "ok",
 			"time":   time.Now().UTC().Format(time.RFC3339),
 			"checks": jsonResponse{
 				"github_oauth": cfg.GitHubClientID != "",
-				"storage":      "github-only (stateless)",
+				"storage":      storage,
+				"ssrf_strict":  cfg.SSRFStrict,
 			},
 		})
 	})
@@ -1578,7 +1586,18 @@ window.location.replace('/');
 		}(task.ID, rec.ID, login, syncReq, ghToken)
 	})
 
-	log.Println("routes registered (stateless mode — no disk storage)")
+	// Log the real persistence posture (DRAFTS_FILE may legitimately enable an
+	// on-disk snapshot), plus the active SSRF mode, so the startup log matches
+	// what /api/health reports.
+	draftMode := "drafts: memory (cleared on restart)"
+	if cfg.DraftsFile != "" {
+		draftMode = "drafts: " + cfg.DraftsFile
+	}
+	ssrfMode := "permissive (private LLM endpoints allowed)"
+	if cfg.SSRFStrict {
+		ssrfMode = "strict (public hosts only)"
+	}
+	log.Printf("routes registered (%s, ssrf: %s)", draftMode, ssrfMode)
 }
 
 // ─── Utility ─────────────────────────────────────────────────────────────────

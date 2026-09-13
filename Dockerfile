@@ -5,7 +5,9 @@ FROM golang:1.23-alpine AS builder
 WORKDIR /build
 
 # 先拷贝依赖描述文件，利用层缓存
-COPY go.mod go.sum ./
+# 注意：本项目零第三方依赖（纯标准库），仓库内没有 go.sum，
+# 因此只拷贝 go.mod；若将来引入依赖需同时 COPY go.sum。
+COPY go.mod ./
 RUN go mod download
 
 # 拷贝源码并编译（静态链接，极小体积）
@@ -31,6 +33,13 @@ EXPOSE 8080
 # 工作目录设为 / 即可，web 目录由程序内部引用 "web"
 WORKDIR /
 
-ENV APP_ADDR=:8080
+# 监听地址可用 --build-arg APP_ADDR=:80 覆盖；运行时也可用同名环境变量覆盖。
+ARG APP_ADDR=:8080
+ENV APP_ADDR=${APP_ADDR}
+
+# 最终镜像是 scratch：没有 shell 也没有 wget，健康检查必须以 exec 形式
+# 由二进制自检（/zpwu -healthcheck），否则容器会一直被标记为 unhealthy。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/zpwu", "-healthcheck"]
 
 ENTRYPOINT ["/zpwu"]
