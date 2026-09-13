@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -328,6 +330,8 @@ func (g *llmGateway) chatClaude(ctx context.Context, p providerInlineReq, system
 	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
+	} else if err := agent.ValidateLLMBaseURL(baseURL); err != nil {
+		return "", nil, err // SSRF guard on user-supplied Claude endpoint
 	}
 	endpoint := baseURL + "/v1/messages"
 
@@ -580,10 +584,11 @@ func (s *sseApprover) RequestApproval(ctx context.Context, callID, filePath, con
 	// Truncate content for SSE preview — the full content is held in-memory by
 	// the executor and will be written to GitHub after approval.
 	// Sending megabytes over SSE would break the event stream.
-	const maxPreview = 4096
+	// #fix: truncate on rune boundaries so multi-byte UTF-8 (CJK) is not corrupted.
+	const maxRunes = 4096
 	previewContent := content
-	if len(previewContent) > maxPreview {
-		previewContent = previewContent[:maxPreview] + "\n\n… (内容过长，已截断预览)"
+	if r := []rune(previewContent); len(r) > maxRunes {
+		previewContent = string(r[:maxRunes]) + "\n\n… (内容过长，已截断预览)"
 	}
 	ch, err := s.store.begin(callID, s.ownerLogin)
 	if err != nil {
@@ -601,6 +606,19 @@ func (s *sseApprover) RequestApproval(ctx context.Context, callID, filePath, con
 	})
 	// Block until the user responds via POST /api/agent/approve
 	return s.store.wait(ctx, ch)
+}
+
+// agentDraftSaver implements agent.DraftSaver by writing into the in-memory
+// draft store. write_file results are staged here for review instead of being
+// committed directly to GitHub.
+type agentDraftSaver struct {
+	store *draftStore
+	login string
+}
+
+func (s *agentDraftSaver) SaveDraft(_ context.Context, req agent.DraftSaveRequest) (string, error) {
+	rec := s.store.save(s.login, req.Owner, req.Repo, req.Branch, req.FilePath, req.OriginalContent, req.Content, req.CommitMessage)
+	return rec.ID, nil
 }
 
 // ─── Draft Store (in-memory, per GitHub-login) ───────────────────────────────
@@ -624,10 +642,66 @@ type draftStore struct {
 	items map[string]*draftRecord // id → record
 	order []string                // newest-first insertion order
 	seq   atomic.Uint64
+	path  string // optional JSON file for persistence; empty = in-memory only
 }
 
-func newDraftStore() *draftStore {
-	return &draftStore{items: make(map[string]*draftRecord)}
+func newDraftStore(path string) *draftStore {
+	d := &draftStore{items: make(map[string]*draftRecord), path: path}
+	if path != "" {
+		d.load()
+	}
+	return d
+}
+
+// load restores drafts from the backing file. A corrupt or unreadable file is
+// treated as empty so a bad snapshot never prevents the server from starting.
+func (d *draftStore) load() {
+	raw, err := os.ReadFile(d.path)
+	if err != nil {
+		return
+	}
+	var records []*draftRecord
+	if err := json.Unmarshal(raw, &records); err != nil {
+		log.Printf("draft store: ignoring corrupt snapshot %s: %v", d.path, err)
+		return
+	}
+	d.order = d.order[:0]
+	for _, rec := range records {
+		if rec == nil || rec.ID == "" {
+			continue
+		}
+		cp := *rec
+		d.items[cp.ID] = &cp
+		d.order = append(d.order, cp.ID)
+	}
+	log.Printf("draft store: restored %d draft(s) from %s", len(d.items), d.path)
+}
+
+// persistLocked writes the current snapshot atomically. Must be called with d.mu
+// held for writing. No-op when persistence is disabled.
+func (d *draftStore) persistLocked() {
+	if d.path == "" {
+		return
+	}
+	records := make([]*draftRecord, 0, len(d.order))
+	for _, id := range d.order {
+		if r, ok := d.items[id]; ok {
+			cp := *r
+			records = append(records, &cp)
+		}
+	}
+	data, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := d.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		log.Printf("draft store: write failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, d.path); err != nil {
+		log.Printf("draft store: rename failed: %v", err)
+	}
 }
 
 func (d *draftStore) save(login, owner, repo, branch, filePath, originalContent, content, commitMsg string) *draftRecord {
@@ -635,7 +709,7 @@ func (d *draftStore) save(login, owner, repo, branch, filePath, originalContent,
 	defer d.mu.Unlock()
 	now := time.Now().UTC().Format(time.RFC3339)
 	// Upsert: if a draft for the same login+repo+file already exists, overwrite it
-	for _, id := range d.order {
+	for i, id := range d.order {
 		if r, ok := d.items[id]; ok &&
 			r.Login == login && r.Owner == owner && r.Repo == repo &&
 			r.Branch == branch && r.FilePath == filePath {
@@ -646,6 +720,15 @@ func (d *draftStore) save(login, owner, repo, branch, filePath, originalContent,
 			r.Content = content
 			r.CommitMessage = commitMsg
 			r.UpdatedAt = now
+			// Move the refreshed draft to the top so "recently updated" ordering
+			// reflects the latest activity, not the first creation time.
+			if i != 0 {
+				rest := make([]string, 0, len(d.order)-1)
+				rest = append(rest, d.order[:i]...)
+				rest = append(rest, d.order[i+1:]...)
+				d.order = append([]string{id}, rest...)
+			}
+			d.persistLocked()
 			clone := *r
 			return &clone
 		}
@@ -659,6 +742,7 @@ func (d *draftStore) save(login, owner, repo, branch, filePath, originalContent,
 	}
 	d.items[id] = rec
 	d.order = append([]string{id}, d.order...)
+	d.persistLocked()
 	clone := *rec
 	return &clone
 }
@@ -701,6 +785,7 @@ func (d *draftStore) delete(id, login string) bool {
 		}
 	}
 	d.order = newOrder
+	d.persistLocked()
 	return true
 }
 
@@ -718,6 +803,7 @@ func (d *draftStore) deleteAll(login string) int {
 		}
 	}
 	d.order = newOrder
+	d.persistLocked()
 	return n
 }
 
@@ -725,7 +811,7 @@ func (d *draftStore) deleteAll(login string) int {
 
 func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 	tasks := newTaskStore()
-	drafts := newDraftStore()
+	drafts := newDraftStore(cfg.DraftsFile)
 	approvals := newApprovalStore()
 	gateway := newLLMGateway()
 	ghClient := &http.Client{Timeout: 30 * time.Second}
@@ -770,7 +856,7 @@ func RegisterRoutes(mux *http.ServeMux, cfg config.Config) {
 			Secure:   secure,
 			SameSite: http.SameSiteLaxMode,
 		})
-		redirectURI := strings.TrimRight(appBaseURL(r), "/") + "/api/auth/github/callback"
+		redirectURI := strings.TrimRight(appBaseURL(r, cfg.PublicBaseURL), "/") + "/api/auth/github/callback"
 		authURL := fmt.Sprintf(
 			"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo&state=%s",
 			url.QueryEscape(cfg.GitHubClientID),
@@ -1290,6 +1376,8 @@ window.location.replace('/');
 		runReq := req.BuildRunRequest(ghToken)
 		// Wire up user-approval gate for write_file tool calls
 		runReq.Approver = &sseApprover{emitter: emitter, store: approvals, ownerLogin: login}
+		// Route write_file into the draft box so files aren't committed directly.
+		runReq.DraftSaver = &agentDraftSaver{store: drafts, login: login}
 		_, _ = agent.Run(r.Context(), runReq, emitter)
 	})
 
@@ -1392,6 +1480,10 @@ window.location.replace('/');
 			if req.CommitMessage == "" {
 				req.CommitMessage = "update: " + req.FilePath
 			}
+			if agent.IsRestrictedPath(req.FilePath) {
+				writeError(w, http.StatusBadRequest, "restricted_path", "writing to this path is restricted for security reasons")
+				return
+			}
 			rec := drafts.save(login, req.Owner, req.Repo, req.Branch, req.FilePath, req.OriginalContent, req.Content, req.CommitMessage)
 			writeJSON(w, http.StatusOK, jsonResponse{"draft": rec})
 
@@ -1455,6 +1547,10 @@ window.location.replace('/');
 			writeError(w, http.StatusNotFound, "draft_not_found", "draft not found or not owned by you")
 			return
 		}
+		if agent.IsRestrictedPath(rec.FilePath) {
+			writeError(w, http.StatusBadRequest, "restricted_path", "this draft targets a restricted path and cannot be pushed")
+			return
+		}
 		commitMsg := rec.CommitMessage
 		if strings.TrimSpace(body.CommitMessage) != "" {
 			commitMsg = strings.TrimSpace(body.CommitMessage)
@@ -1500,8 +1596,54 @@ func authorizeRequest(w http.ResponseWriter, r *http.Request, expectedToken stri
 	return true
 }
 
-// resolveGitHubLogin fetches the GitHub login name for the given token.
+// loginCacheTTL bounds how long a resolved GitHub login is reused, so a burst of
+// tool/draft requests does not hit the GitHub /user endpoint once per call.
+const loginCacheTTL = 5 * time.Minute
+
+type loginCacheEntry struct {
+	login   string
+	expires time.Time
+}
+
+var (
+	loginCacheMu sync.Mutex
+	loginCache   = map[string]loginCacheEntry{}
+)
+
+// resolveGitHubLogin returns the GitHub login for a token, caching the result
+// keyed by the token's SHA-256 hash (the raw token is never used as a map key).
 func resolveGitHubLogin(ctx context.Context, token string, client *http.Client) (string, error) {
+	sum := sha256.Sum256([]byte(token))
+	key := hex.EncodeToString(sum[:])
+
+	loginCacheMu.Lock()
+	if e, ok := loginCache[key]; ok && time.Now().Before(e.expires) {
+		loginCacheMu.Unlock()
+		return e.login, nil
+	}
+	loginCacheMu.Unlock()
+
+	login, err := fetchGitHubLogin(ctx, token, client)
+	if err != nil {
+		return "", err
+	}
+
+	loginCacheMu.Lock()
+	loginCache[key] = loginCacheEntry{login: login, expires: time.Now().Add(loginCacheTTL)}
+	if len(loginCache) > 256 { // opportunistic prune to bound memory
+		now := time.Now()
+		for k, v := range loginCache {
+			if now.After(v.expires) {
+				delete(loginCache, k)
+			}
+		}
+	}
+	loginCacheMu.Unlock()
+	return login, nil
+}
+
+// fetchGitHubLogin performs the actual GitHub /user lookup.
+func fetchGitHubLogin(ctx context.Context, token string, client *http.Client) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
 	if err != nil {
 		return "", err
@@ -1547,13 +1689,22 @@ func fallback(v, d string) string {
 
 func safeSnippet(text string) string {
 	text = strings.TrimSpace(text)
-	if len(text) > 240 {
-		text = text[:240] + "..."
+	const max = 240
+	if len(text) > max {
+		runes := []rune(text)
+		if len(runes) > max {
+			text = string(runes[:max]) + "..."
+		}
 	}
 	return text
 }
 
-func appBaseURL(r *http.Request) string {
+func appBaseURL(r *http.Request, configured string) string {
+	// A configured public URL is authoritative: it prevents an attacker-controlled
+	// Host header from steering the OAuth redirect_uri to an external host.
+	if configured != "" {
+		return configured
+	}
 	scheme := "https"
 	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") == "" {
 		scheme = "http"

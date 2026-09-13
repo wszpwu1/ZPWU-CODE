@@ -31,7 +31,8 @@ function setStatus(el, txt, type) {
 function esc(s) {
   return String(s)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
 }
 
 // ─── API 请求 ─────────────────────────────────────────
@@ -701,6 +702,29 @@ async function runSimpleMode(msg, pv) {
 // #fix7: AbortController cancels SSE when user navigates away or re-sends
 let agentAbortCtrl = null;
 
+// commitTurnToHistory appends the just-finished agent turn to chatHistory so the
+// next user message keeps full context. It runs even when there was no final
+// text reply (max-rounds / errors) so staged tool calls are not lost. assistant
+// tool_calls with an empty array are normalized to [] only when present, and the
+// history window is bounded to avoid unbounded growth.
+function commitTurnToHistory(msg, finalReply, pendingToolCalls, toolResults) {
+  const calls = pendingToolCalls || [];
+  if (!msg && !finalReply && calls.length === 0) return; // nothing to record
+  chatHistory.push({ role:'user', content: msg || '' });
+  const assistantEntry = { role:'assistant', content: finalReply || '' };
+  if (calls.length) {
+    assistantEntry.tool_calls = calls.map(tc => ({
+      id: tc.call_id, type:'function',
+      function: { name: tc.tool_name, arguments: tc.args || '{}' },
+    }));
+  }
+  chatHistory.push(assistantEntry);
+  for (const tc of calls) {
+    chatHistory.push({ role:'tool', content: (toolResults && toolResults.get(tc.call_id)) || '', tool_call_id: tc.call_id });
+  }
+  if (chatHistory.length > 60) chatHistory = chatHistory.slice(-60);
+}
+
 async function runAgentMode(msg, pv) {
   if (!currentOwnerRepo) {
     $('agentRepoHint').hidden=false;
@@ -826,29 +850,23 @@ async function runAgentMode(msg, pv) {
             finalReply=ev.content;
             break;
 
-          case 'done':
+          case 'done': {
+            // The turn ended. Show a final message if any; otherwise keep the
+            // thinking line with a ✓ summary.
             if (finalReply) {
               thinkEl.remove();
               appendMsg('ai', finalReply);
-              // #fix3: build complete history entry including tool calls
-              chatHistory.push({role:'user',content:msg});
-              // assistant turn with tool_calls array (if any)
-              const assistantEntry={role:'assistant',content:finalReply,tool_calls:[]};
-              for (const tc of pendingToolCalls) {
-                assistantEntry.tool_calls.push({id:tc.call_id,type:'function',function:{name:tc.tool_name,arguments:tc.args}});
-              }
-              chatHistory.push(assistantEntry);
-              // tool result turns
-              for (const tc of pendingToolCalls) {
-                const result=toolResults.get(tc.call_id)||'';
-                chatHistory.push({role:'tool',content:result,tool_call_id:tc.call_id});
-              }
-              // keep history bounded
-              if (chatHistory.length>60) chatHistory=chatHistory.slice(-60);
             } else {
-              thinkEl.querySelector('.agent-text').textContent='✓ '+ev.content;
+              const textEl = thinkEl.querySelector('.agent-text');
+              if (textEl) textEl.textContent = '✓ ' + (ev.content || '完成');
             }
+            // #fix: ALWAYS commit this turn into chatHistory (previously only when
+            // finalReply was non-empty, which caused the entire tool-call history
+            // to vanish on max-rounds / error paths — the model would "amnesiac"
+            // and repeat tool calls on the next user turn).
+            commitTurnToHistory(msg, finalReply, pendingToolCalls, toolResults);
             break;
+          }
 
           case 'error':
             thinkEl.querySelector('.agent-text').textContent='✗ '+ev.content;

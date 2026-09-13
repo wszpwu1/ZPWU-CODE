@@ -67,9 +67,38 @@
 | `list_dir` | 自动执行 | 列出仓库目录内容 |
 | `read_file` | 自动执行 | 读取文件内容（最大 500KB）|
 | `search_files` | 自动执行 | GitHub 代码搜索查找文件 |
-| `write_file` | **需用户点击允许** | 写入/更新文件并 commit |
+| `write_file` | **默认存入草稿箱** | 暂存修改供 diff 审核后由用户点击推送 |
 
-> **安全限制**：`write_file` 禁止写入 `.github/workflows`、`.github/actions`、`.ssh` 等敏感路径，防止 AI 提示注入攻击篡改 CI/CD。
+> **安全限制**：`write_file` 在直接写入和草稿箱暂存两条路径上都会拒绝 `.github/workflows`、`.github/actions`、`.ssh`、`.gnupg`、`Makefile` 等敏感路径，防止 AI 提示注入篡改 CI/CD 或凭据文件。
+
+> **多轮上下文**：Agent 每一轮的工具调用（含 `write_file` 的 `path`/`draft_id`）都会写入前端 `chatHistory` 并在下一轮回传给 LLM。草稿正文因可能极大不通过 SSE 传输，`draft_id` 作为可追溯引用让模型在需要时重新调用 `read_file` 获取。
+
+---
+
+## 🔐 安全策略（v1.1+）
+
+| 主题 | 默认 | 说明 |
+|------|------|------|
+| 敏感路径拦截 | 强制 | `.github/workflows`、`.github/actions`、`.ssh`、`.gnupg`、`Makefile` 及直接子路径 |
+| LLM 端点 SSRF | 宽松 | 始终拒绝云元数据（`169.254.0.0/16`、`fe80::/10`、`metadata.google.internal`、`0.0.0.0`/`::`）；允许 localhost/私网以兼容本地推理网关 |
+| LLM 端点严格模式 | 关闭 | `SSRF_STRICT=1` 额外拦截回环 + RFC1918 + IPv6 ULA 并对主机名做 DNS 解析校验 |
+| OAuth `redirect_uri` | 从 `Host` 头推导 | 生产部署强烈建议设置 `APP_PUBLIC_URL` 避免被伪造 Host 头攻击 |
+| GitHub login 解析 | 5 分钟 TTL 内存缓存 | 减少 `/user` 调用；密钥以 SHA-256 摘要为键存储 |
+| 草稿持久化 | 关闭（仅内存） | 设置 `DRAFTS_FILE=<path>` 后原子写入 JSON（0600），跨重启保留 |
+| UTF-8 截断 | 强制 rune 安全 | 所有 `safeSnippet` / SSE 预览 / 参数展示按字符不按字节，防止 CJK 撕裂 |
+
+---
+
+## 🎨 PWA 图标
+
+`web/icons/` 内置 `icon-192.png`、`icon-512.png`、`maskable-icon-512.png`、`apple-touch-icon.png`。如需重新生成：
+
+```powershell
+# 需要在 Windows PowerShell 下运行（依赖 System.Drawing）
+powershell -File tools/gen-icons.ps1
+```
+
+修改后请将 `web/sw.js` 里的 `CACHE_NAME` 版本号 `+1`，让 Service Worker 强制刷新。
 
 ---
 
@@ -95,10 +124,16 @@ docker run -d \
   -e GITHUB_CLIENT_ID=你的ClientID \
   -e GITHUB_CLIENT_SECRET=你的ClientSecret \
   -e APP_ACCESS_TOKEN=可选的访问令牌 \
+  -e APP_PUBLIC_URL=https://code.example.com \
   ghcr.io/wszpwu1/zpwu-code:latest
 ```
 
 访问 `http://your-server:8080`
+
+> **公网 / 反向代理部署强烈建议同时设置**：
+> - `APP_PUBLIC_URL`：让 OAuth `redirect_uri` 使用可信基址，防止 Host 头攻击
+> - `SSRF_STRICT=1`：仅当**不需要**把模型端点指向本地/内网推理网关时启用
+> - `DRAFTS_FILE=/data/drafts.json`：让草稿箱跨进程重启保留（记得挂载 `-v zpwu-data:/data`）
 
 ---
 

@@ -87,8 +87,9 @@ type RunRequest struct {
 	History      []Message
 	UserMessage  string
 	Repo         RepoCtx
-	MaxRounds    int      // default 10
-	Approver     Approver // gates write_file; nil → NoopApprover
+	MaxRounds    int        // default 10
+	Approver     Approver   // gates write_file (legacy direct-write path)
+	DraftSaver   DraftSaver // stages write_file into the draft box; nil → direct write
 }
 
 // Message is a conversation turn.
@@ -112,6 +113,11 @@ func NormalizeOpenAIEndpoint(base string) (string, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", errors.New("base_url must be a valid absolute URL")
 	}
+	// SSRF guard: never let a user-supplied base_url point the server at
+	// internal/metadata endpoints.
+	if err := ValidateLLMBaseURL(base); err != nil {
+		return "", err
+	}
 	// Strip trailing slashes and any known endpoint suffixes first.
 	trimmed := strings.TrimRight(base, "/")
 	trimmed = strings.TrimSuffix(trimmed, "/v1/chat/completions")
@@ -122,6 +128,17 @@ func NormalizeOpenAIEndpoint(base string) (string, error) {
 		trimmed = trimmed[:idx]
 	}
 	return trimmed + "/v1/chat/completions", nil
+}
+
+// truncateForDisplay shortens s to at most maxRunes runes for UI display, adding
+// an ellipsis when truncated. It operates on runes (not bytes) so multi-byte UTF-8
+// sequences — e.g. CJK characters — are never split into invalid runes.
+func truncateForDisplay(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
 }
 
 // ─── Agent Loop ───────────────────────────────────────────────────────────────
@@ -179,15 +196,69 @@ func Run(ctx context.Context, req RunRequest, emitter Emitter) ([]Message, error
 
 		// Execute tool calls sequentially
 		for _, tc := range toolCalls {
-			argsDisplay := tc.Function.Arguments
-			if len(argsDisplay) > 300 {
-				argsDisplay = argsDisplay[:300] + "…"
-			}
+			argsDisplay := truncateForDisplay(tc.Function.Arguments, 300)
 
-			// ── write_file: gate behind user approval (approver emits the SSE event) ──
+			// ── write_file: route to draft box (review-then-push) instead of committing ──
 			if tc.Function.Name == "write_file" {
 				var args map[string]string
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+
+				// Draft mode: stage the change so the user can review the diff and
+				// push it themselves. This avoids corrupting files with an
+				// unreviewed write. The content itself is never streamed over SSE
+				// (it may be very large) — the full diff lives in the draft box.
+				if req.DraftSaver != nil {
+					if IsRestrictedPath(args["path"]) {
+						result := fmt.Sprintf("write_file: path '%s' 属于受保护路径（CI/CD 工作流、凭据文件等），已阻止写入草稿。", args["path"])
+						emitter.Emit(Event{Type: EventToolResult, Tool: tc.Function.Name, CallID: tc.ID, Content: result, Round: round})
+						history = append(history, Message{Role: "tool", Content: result, ToolCallID: tc.ID})
+						continue
+					}
+					original, origErr := executor.ReadOriginalContent(ctx, args["path"])
+					if origErr != nil {
+						result := fmt.Sprintf("读取原文件失败，无法暂存草稿: %v", origErr)
+						emitter.Emit(Event{Type: EventToolResult, Tool: tc.Function.Name, CallID: tc.ID, Content: result, Round: round})
+						history = append(history, Message{Role: "tool", Content: result, ToolCallID: tc.ID})
+						continue
+					}
+					draftID, saveErr := req.DraftSaver.SaveDraft(ctx, DraftSaveRequest{
+						Owner:           req.Repo.Owner,
+						Repo:            req.Repo.Repo,
+						Branch:          req.Repo.Branch,
+						FilePath:        args["path"],
+						OriginalContent: original,
+						Content:         args["content"],
+						CommitMessage:   args["commit_message"],
+					})
+					if saveErr != nil {
+						result := fmt.Sprintf("保存草稿失败: %v", saveErr)
+						emitter.Emit(Event{Type: EventToolResult, Tool: tc.Function.Name, CallID: tc.ID, Content: result, Round: round})
+						history = append(history, Message{Role: "tool", Content: result, ToolCallID: tc.ID})
+						continue
+					}
+					// Compact tool card: path + commit message + draft id go over SSE.
+					// The full content is not streamed (it may be very large) but the
+					// draft_id is a recoverable reference so multi-turn history can
+					// point the model back at the exact staged file.
+					compact, _ := json.Marshal(map[string]string{
+						"path":           args["path"],
+						"commit_message": args["commit_message"],
+						"draft_id":       draftID,
+					})
+					emitter.Emit(Event{
+						Type:   EventToolCall,
+						Tool:   tc.Function.Name,
+						CallID: tc.ID,
+						Input:  string(compact),
+						Round:  round,
+					})
+					result := fmt.Sprintf("已将 '%s' 的修改保存到草稿箱（草稿ID: %s），尚未推送到 GitHub。请到「草稿箱」审核 diff 后再推送；如需基于该草稿继续修改，可对其路径调用 read_file。", args["path"], draftID)
+					emitter.Emit(Event{Type: EventToolResult, Tool: tc.Function.Name, CallID: tc.ID, Content: result, Round: round})
+					history = append(history, Message{Role: "tool", Content: result, ToolCallID: tc.ID})
+					continue
+				}
+
+				// Legacy fallback (no DraftSaver): approve then commit directly.
 				// NOTE: do NOT emit EventApproval here — sseApprover.RequestApproval
 				// already emits it. Emitting twice would render two cards in the UI.
 				approved, approveErr := approver.RequestApproval(
@@ -227,10 +298,7 @@ func Run(ctx context.Context, req RunRequest, emitter Emitter) ([]Message, error
 				result = fmt.Sprintf("Tool execution error: %v", execErr)
 			}
 
-			resultSnippet := result
-			if len(resultSnippet) > 400 {
-				resultSnippet = resultSnippet[:400] + "…"
-			}
+			resultSnippet := truncateForDisplay(result, 400)
 			emitter.Emit(Event{
 				Type:    EventToolResult,
 				Tool:    tc.Function.Name,
@@ -354,6 +422,8 @@ func callClaude(ctx context.Context, client *http.Client, req RunRequest, histor
 	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
+	} else if err := ValidateLLMBaseURL(baseURL); err != nil {
+		return "", nil, err // SSRF guard on user-supplied Claude endpoint
 	}
 	endpoint := baseURL + "/v1/messages"
 

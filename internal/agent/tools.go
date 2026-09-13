@@ -265,6 +265,41 @@ func (e *Executor) readFile(ctx context.Context, filePath string) (string, error
 	return fmt.Sprintf("File: %s\n---\n%s", filePath, content), nil
 }
 
+// ReadOriginalContent fetches the current content of a file from GitHub so it
+// can be stored as the "original" side of a draft diff. Returns an empty string
+// when the file does not exist yet (new file).
+func (e *Executor) ReadOriginalContent(ctx context.Context, filePath string) (string, error) {
+	filePath = sanitizePath(filePath)
+	if filePath == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s?ref=%s",
+		url.PathEscape(e.repo.Owner), url.PathEscape(e.repo.Repo),
+		escapeContentPath(filePath), url.QueryEscape(e.repo.Branch))
+
+	raw, status, err := e.ghGET(ctx, apiURL)
+	if err != nil {
+		return "", err
+	}
+	if status == 404 {
+		return "", nil // new file
+	}
+	if status < 200 || status > 299 {
+		return "", fmt.Errorf("GitHub API error %d: %s", status, safeSnippet(string(raw)))
+	}
+	var ghFile struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &ghFile); err != nil {
+		return "", fmt.Errorf("parse file response: %w", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(ghFile.Content, "\n", ""))
+	if err != nil {
+		return "", fmt.Errorf("decode file content: %w", err)
+	}
+	return string(decoded), nil
+}
+
 // ── write_file ────────────────────────────────────────────────────────────────
 
 // dangerousPrefixes lists path prefixes that the agent should never write to.
@@ -277,6 +312,20 @@ var dangerousPrefixes = []string{
 	"Makefile",
 }
 
+// IsRestrictedPath reports whether path targets a security-sensitive location
+// that must never be written to (CI/CD workflows, credential files, etc.).
+// It is applied on both the direct write_file path and the draft-staging path
+// so the guard holds regardless of how a write is routed.
+func IsRestrictedPath(path string) bool {
+	lp := strings.ToLower(sanitizePath(path))
+	for _, prefix := range dangerousPrefixes {
+		if lp == strings.ToLower(prefix) || strings.HasPrefix(lp, strings.ToLower(prefix)+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Executor) writeFile(ctx context.Context, filePath, content, commitMsg string) (string, error) {
 	if filePath == "" {
 		return "", fmt.Errorf("path is required")
@@ -286,11 +335,8 @@ func (e *Executor) writeFile(ctx context.Context, filePath, content, commitMsg s
 	}
 	filePath = sanitizePath(filePath)
 	// #fix5: block writes to dangerous paths
-	lp := strings.ToLower(filePath)
-	for _, prefix := range dangerousPrefixes {
-		if lp == strings.ToLower(prefix) || strings.HasPrefix(lp, strings.ToLower(prefix)+"/") {
-			return fmt.Sprintf("write_file: path '%s' is restricted for security reasons. Modifying CI/CD workflows or credential files is not allowed.", filePath), nil
-		}
+	if IsRestrictedPath(filePath) {
+		return fmt.Sprintf("write_file: path '%s' is restricted for security reasons. Modifying CI/CD workflows or credential files is not allowed.", filePath), nil
 	}
 
 	// Get existing SHA (needed for updates)
@@ -447,8 +493,12 @@ func escapeContentPath(path string) string {
 
 func safeSnippet(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) > 200 {
-		return s[:200] + "..."
+	const max = 200
+	if len(s) > max {
+		runes := []rune(s)
+		if len(runes) > max {
+			return string(runes[:max]) + "..."
+		}
 	}
 	return s
 }
@@ -458,4 +508,25 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ─── Draft staging (write_file → draft box instead of direct commit) ─────────
+
+// DraftSaveRequest describes a file write that should be staged as a pending
+// draft for human review instead of being committed directly to GitHub.
+type DraftSaveRequest struct {
+	Owner           string
+	Repo            string
+	Branch          string
+	FilePath        string
+	OriginalContent string // content before edit (empty for new files)
+	Content         string // the edited content
+	CommitMessage   string
+}
+
+// DraftSaver persists write_file results into the server draft box. The agent
+// loop calls it instead of writing directly to GitHub, so the user can review
+// the diff before pushing. Implementations are injected by the HTTP layer.
+type DraftSaver interface {
+	SaveDraft(ctx context.Context, req DraftSaveRequest) (draftID string, err error)
 }

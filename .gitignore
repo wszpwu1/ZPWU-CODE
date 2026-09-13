@@ -1,0 +1,39 @@
+# ---- 本地环境与密钥（.env.example 需保留跟踪）----
+.env
+.env.local
+*.env
+!.env.example
+
+# ---- 运行时数据：草稿落盘 / 日志 ----
+/data/
+*.db
+*.db-*
+drafts.json
+tmp-drafts.json
+*.log
+
+# ---- 编译产物 ----
+/server
+/zpwu
+/zpwu-code
+zpwu-test.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/dist/
+/build/
+
+# ---- Go 工作流 / 测试产物 ----
+*.test
+*.out
+coverage.*
+vendor/
+
+# ---- 编辑器与系统垃圾 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
